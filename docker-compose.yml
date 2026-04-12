@@ -1,0 +1,105 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────
+# opentrend — custom services
+#
+# The prof's 3 containers (hadoop-master, hadoop-worker1,
+# hadoop-worker2) are started separately with docker run.
+# This file only manages the 3 containers YOU build.
+#
+# Prerequisites before running this file:
+#   docker start hadoop-master hadoop-worker1 hadoop-worker2
+#   (then inside hadoop-master: start hadoop, kafka, hbase)
+# ─────────────────────────────────────────────────────────────
+
+networks:
+  hadoop:
+    external: true   # joins the network created in Step 0
+
+services:
+
+  # ── 1. PRODUCER ───────────────────────────────────────────
+  # Polls GitHub Events API every 60s and publishes raw events
+  # to Kafka on hadoop-master:9092
+  producer:
+    build: ./producer
+    container_name: opentrend-producer
+    restart: unless-stopped
+    networks:
+      - hadoop
+    environment:
+      - KAFKA_HOST=hadoop-master:9092
+      - KAFKA_TOPIC=github-events
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - POLL_INTERVAL=60          # seconds between API polls
+    volumes:
+      - ./producer:/app           # live reload during development
+    depends_on: []                # hadoop-master is external, no depends_on needed
+
+  # ── 2. SPARK RUNNER ───────────────────────────────────────
+  # Holds your PySpark jobs. The streaming job runs on startup.
+  # The batch job is triggered by the scheduler inside producer.
+  # Both submit to YARN on hadoop-master:8088
+  spark:
+    build: ./spark
+    container_name: opentrend-spark
+    restart: unless-stopped
+    networks:
+      - hadoop
+    environment:
+      - HADOOP_CONF_DIR=/etc/hadoop
+      - YARN_CONF_DIR=/etc/hadoop
+      - KAFKA_HOST=hadoop-master:9092
+      - KAFKA_TOPIC=github-events
+      - HBASE_HOST=hadoop-master
+      - HDFS_HOST=hadoop-master:9000
+    volumes:
+      - ./spark:/app              # your .py job files
+      - ./data/gharchive:/data/gharchive  # batch input files
+    command: >
+      spark-submit
+        --master yarn
+        --deploy-mode client
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
+        /app/streaming_job.py
+
+  # ── 3. BACKEND ────────────────────────────────────────────
+  # FastAPI — reads HBase via happybase (Thrift on port 9090)
+  # Exposes REST endpoints + WebSocket for the dashboard
+  backend:
+    build: ./backend
+    container_name: opentrend-backend
+    restart: unless-stopped
+    networks:
+      - hadoop
+    ports:
+      - "8000:8000"
+    environment:
+      - HBASE_HOST=hadoop-master
+      - HBASE_PORT=9090           # HBase Thrift port
+      - KAFKA_HOST=hadoop-master:9092
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ── 4. FRONTEND ───────────────────────────────────────────
+  # React dashboard — calls backend on port 8000
+  frontend:
+    build: ./frontend
+    container_name: opentrend-frontend
+    restart: unless-stopped
+    networks:
+      - hadoop
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
+    volumes:
+      - ./frontend/src:/app/src   # live reload during development
+    depends_on:
+      - backend
