@@ -1,0 +1,75 @@
+# ------------------------------
+# OS / Editor
+# ------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ------------------------------
+# Python
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing / coverage / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ------------------------------
+# Environment / secrets
+# ------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ------------------------------
+# Logs / runtime
+# ------------------------------
+*.log
+logs/
+*.pid
+*.out
+
+# ------------------------------
+# Docker / Compose
+# ------------------------------
+docker-compose.override.yml
+
+# ------------------------------
+# Big data local artifacts
+# ------------------------------
+data/gharchive/*
+!data/gharchive/.gitkeep
+
+# Spark temporary outputs
+spark-warehouse/
+metastore_db/
+derby.log
+
+# HBase / Hadoop local state (if generated locally)
+hbase/data/
+hbase/logs/
