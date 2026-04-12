@@ -25,7 +25,7 @@ pip-wheel-metadata/
 venv/
 env/
 ENV/
-
+my-env/
 # Testing / coverage / type-check caches
 .pytest_cache/
 .mypy_cache/
