@@ -1,7 +1,7 @@
 """
 opentrend — producer.py
 ------------------------
-Polls the GitHub Events API every 60 seconds and publishes
+Polls the GitHub Events API every 5 seconds and publishes
 WatchEvents (stars) and ForkEvents to the Kafka topic
 'github-events'.
 
@@ -27,7 +27,7 @@ load_dotenv(BASE_DIR / ".env")
 KAFKA_HOST  = os.getenv("KAFKA_HOST", "hadoop-master:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "github-events")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+POLL_INTERVAL = 5
 GITHUB_API_URL = "https://api.github.com/events?per_page=100"
 
 # ── Logging ───────────────────────────────────────────────────
