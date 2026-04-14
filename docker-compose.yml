@@ -39,7 +39,7 @@ services:
   # ── 2. SPARK RUNNER ───────────────────────────────────────
   # Holds your PySpark jobs. The streaming job runs on startup.
   # The batch job is triggered by the scheduler inside producer.
-  # Both submit to YARN on hadoop-master:8088
+  # Submits to YARN on hadoop-master
   spark:
     build: ./spark
     container_name: opentrend-spark
@@ -60,6 +60,12 @@ services:
       spark-submit
         --master yarn
         --deploy-mode client
+        --conf spark.hadoop.yarn.resourcemanager.hostname=hadoop-master
+        --conf spark.hadoop.yarn.resourcemanager.address=hadoop-master:8032
+        --conf spark.hadoop.yarn.resourcemanager.scheduler.address=hadoop-master:8030
+        --conf spark.hadoop.yarn.resourcemanager.resource-tracker.address=hadoop-master:8031
+        --conf spark.hadoop.yarn.resourcemanager.admin.address=hadoop-master:8033
+        --conf spark.hadoop.fs.defaultFS=hdfs://hadoop-master:9000
         --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
         /app/streaming_job.py
 
