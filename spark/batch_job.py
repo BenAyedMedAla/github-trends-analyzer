@@ -1,0 +1,234 @@
+"""
+opentrend — batch_job.py
+--------------------------
+Reads GH Archive .json.gz files from HDFS, computes weekly
+metrics per repo, and writes results to HBase.
+
+Run manually or triggered by scheduler.py weekly.
+
+Pipeline (TP1 MapReduce logic, rewritten in PySpark TP2 style):
+  HDFS /user/root/gharchive/*.json.gz
+    → PySpark (read + aggregate)
+      → HBase: weekly_metrics  (star velocity per repo)
+      → HBase: ml_predictions  (simple trending score)
+"""
+
+import os
+import sys
+import happybase
+import logging
+from dotenv import load_dotenv
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, count, sum as spark_sum,
+    when, lit, desc, round as spark_round
+)
+from pyspark.sql.types import StructType, StructField, StringType
+
+load_dotenv()
+
+# ── Configuration ─────────────────────────────────────────────
+HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
+HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
+HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
+HDFS_INPUT  = f"hdfs://{HDFS_HOST}/user/root/gharchive/*.json.gz"
+
+# ── Logging ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
+log = logging.getLogger("batch_job")
+
+
+def get_hbase_connection():
+    return happybase.Connection(
+        host=HBASE_HOST,
+        port=HBASE_PORT,
+        timeout=10000
+    )
+
+
+def write_weekly_metrics(df_weekly):
+    """
+    Write weekly aggregated metrics to HBase weekly_metrics table.
+
+    Row key: week_date#repo_name
+    Column families: repo (name, language) / stats (stars, forks, velocity)
+    """
+    rows = df_weekly.collect()
+    log.info(f"Writing {len(rows)} rows to weekly_metrics...")
+
+    connection = get_hbase_connection()
+    table = connection.table("weekly_metrics")
+
+    for row in rows:
+        repo_name  = row["repo_name"]  or "unknown"
+        week       = row["week"]       or "unknown"
+        stars      = str(row["star_count"]  or 0)
+        forks      = str(row["fork_count"]  or 0)
+        velocity   = str(row["velocity"]    or 0)
+
+        row_key = f"{week}#{repo_name}".encode("utf-8")
+
+        table.put(row_key, {
+            b"repo:name":       repo_name.encode("utf-8"),
+            b"stats:stars":     stars.encode("utf-8"),
+            b"stats:forks":     forks.encode("utf-8"),
+            b"stats:velocity":  velocity.encode("utf-8"),
+            b"stats:week":      week.encode("utf-8"),
+        })
+
+    connection.close()
+    log.info("weekly_metrics write complete")
+
+
+def write_ml_predictions(df_predictions):
+    """
+    Write ML trending predictions to HBase ml_predictions table.
+
+    Simple scoring model:
+      - velocity > 10  → high probability trending
+      - velocity > 5   → medium
+      - else           → low
+
+    Row key: repo_name
+    Column families: repo (name) / ml (score, cluster, predicted_growth)
+    """
+    rows = df_predictions.collect()
+    log.info(f"Writing {len(rows)} rows to ml_predictions...")
+
+    connection = get_hbase_connection()
+    table = connection.table("ml_predictions")
+
+    for row in rows:
+        repo_name = row["repo_name"] or "unknown"
+        velocity  = row["velocity"]  or 0
+        stars     = row["star_count"] or 0
+
+        # Simple trending probability score (0.0 to 1.0)
+        if velocity > 10:
+            probability = 0.9
+            cluster     = "Rocket repo"
+        elif velocity > 5:
+            probability = 0.6
+            cluster     = "Rising repo"
+        elif velocity > 2:
+            probability = 0.35
+            cluster     = "Steady grower"
+        else:
+            probability = 0.1
+            cluster     = "Low activity"
+
+        # Predicted growth = velocity * 1.2 (simple linear projection)
+        predicted_growth = int(velocity * 1.2)
+
+        row_key = repo_name.encode("utf-8")
+
+        table.put(row_key, {
+            b"repo:name":            repo_name.encode("utf-8"),
+            b"ml:probability":       str(probability).encode("utf-8"),
+            b"ml:cluster":           cluster.encode("utf-8"),
+            b"ml:predicted_growth":  str(predicted_growth).encode("utf-8"),
+            b"ml:velocity":          str(velocity).encode("utf-8"),
+        })
+
+    connection.close()
+    log.info("ml_predictions write complete")
+
+
+def main():
+    log.info("opentrend Spark Batch job starting...")
+    log.info(f"  HDFS input : {HDFS_INPUT}")
+    log.info(f"  HBase      : {HBASE_HOST}:{HBASE_PORT}")
+
+    # ── Create Spark Session ───────────────────────────────────
+    spark = (
+        SparkSession.builder
+        .appName("opentrend-batch")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("WARN")
+    log.info("Spark session created")
+
+    # ── Read GH Archive files from HDFS ───────────────────────
+    # GH Archive files are JSON (one event per line) inside .gz
+    # Spark reads them natively — same as TP1 HDFS file read
+    log.info("Reading GH Archive files from HDFS...")
+    try:
+        raw = spark.read.json(HDFS_INPUT)
+    except Exception as e:
+        log.error(f"Failed to read from HDFS: {e}")
+        log.error("Make sure you have uploaded .json.gz files:")
+        log.error("  hdfs dfs -put yourfile.json.gz /user/root/gharchive/")
+        sys.exit(1)
+
+    log.info(f"Total events loaded: {raw.count()}")
+
+    # ── Filter relevant events ─────────────────────────────────
+    relevant = raw.filter(
+        col("type").isin(
+            "WatchEvent", "ForkEvent", "PushEvent", "CreateEvent"
+        )
+    )
+
+    # ── Extract week from created_at ───────────────────────────
+    # Use substring to get YYYY-MM-DD, then truncate to week start
+    from pyspark.sql.functions import date_trunc, to_timestamp, substring
+
+    events = relevant.select(
+        col("type").alias("event_type"),
+        col("repo.name").alias("repo_name"),
+        col("actor.login").alias("actor"),
+        col("created_at"),
+        date_trunc(
+            "week",
+            to_timestamp(col("created_at"))
+        ).cast("string").alias("week")
+    )
+
+    # ── Weekly aggregation per repo ────────────────────────────
+    # Count stars (WatchEvents) and forks per repo per week
+    # Same MapReduce logic as TP1 WordCount but for repos
+    weekly = (
+        events
+        .groupBy("week", "repo_name")
+        .agg(
+            count(
+                when(col("event_type") == "WatchEvent", 1)
+            ).alias("star_count"),
+            count(
+                when(col("event_type") == "ForkEvent", 1)
+            ).alias("fork_count"),
+            count("*").alias("total_events")
+        )
+        .orderBy(desc("star_count"))
+    )
+
+    # ── Compute velocity ───────────────────────────────────────
+    # Velocity = star_count (simple: stars gained this week)
+    # In a real system you'd compare to previous week
+    weekly_with_velocity = weekly.withColumn(
+        "velocity", col("star_count")
+    )
+
+    log.info("Weekly aggregation complete")
+    weekly_with_velocity.show(10, truncate=False)
+
+    # ── Write to HBase ─────────────────────────────────────────
+    write_weekly_metrics(weekly_with_velocity)
+
+    # ── ML predictions — top 200 repos only ───────────────────
+    top_repos = weekly_with_velocity.orderBy(
+        desc("velocity")
+    ).limit(200)
+
+    write_ml_predictions(top_repos)
+
+    log.info("Batch job complete")
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()
