@@ -1,0 +1,12 @@
+./start-hadoop.sh
+./start-kafka-zookeeper.sh
+start-hbase.sh
+hbase-daemon.sh start thrift
+
+
+
+
+
+# Download 1 hour of data (~50MB)
+curl -o data/gharchive/2024-01-15-14.json.gz https://data.gharchive.org/2024-01-15-14.json.gz
+
