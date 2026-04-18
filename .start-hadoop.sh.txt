@@ -1,5 +1,5 @@
 ./start-hadoop.sh
-./start-kafka-zookeeper.sh
+./start-kafka-zookeeper.sh ( usually x2 until you see kafka in jps)
 start-hbase.sh
 hbase-daemon.sh start thrift
 
