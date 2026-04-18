@@ -52,6 +52,7 @@ EVENT_SCHEMA = StructType([
     StructField("event_type", StringType(), True),
     StructField("repo_name",  StringType(), True),
     StructField("actor",      StringType(), True),
+    StructField("language",   StringType(), True), 
     StructField("created_at", StringType(), True),
 ])
 
@@ -104,10 +105,11 @@ def write_live_metrics(batch_df, batch_id):
 
             # Row key: combines window + repo for unique identification
             row_key = f"{window_start}#{repo_name}".encode("utf-8")
-
+            language = row["language"] if row["language"] else "Unknown"
             live_table.put(row_key, {
                 b"repo:name":        repo_name.encode("utf-8"),
                 b"repo:event_type":  event_type.encode("utf-8"),
+                b"repo:language":    language.encode("utf-8"),
                 b"stats:count":      event_count.encode("utf-8"),
                 b"stats:window":     window_start.encode("utf-8"),
             })
@@ -208,6 +210,7 @@ def main():
             col("event_type"),
             col("actor"),
             col("event_id"),
+            col("language"), 
             col("created_at"),
         )
         .agg(count("*").alias("event_count"))
@@ -218,6 +221,7 @@ def main():
             col("event_type"),
             col("actor"),
             col("event_id"),
+            col("language"),
             col("created_at"),
             col("event_count"),
         )

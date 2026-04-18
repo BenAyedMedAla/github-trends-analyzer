@@ -49,8 +49,35 @@ def get_hbase_connection():
         timeout=10000
     )
 
+def enrich_with_language(df_top, spark):
+    """
+    Call GitHub API to get language for each top repo.
+    Only enriches top 200 repos to stay within rate limits.
+    """
+    import requests
 
-def write_weekly_metrics(df_weekly):
+    repo_names = [row["repo_name"] for row in df_top.collect()]
+    log.info(f"Fetching language for {len(repo_names)} repos...")
+
+    language_map = {}
+    headers = {"Authorization": f"token {os.getenv('GITHUB_TOKEN', '')}"}
+
+    for repo in repo_names:
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{repo}",
+                headers=headers, timeout=5)
+            if r.status_code == 200:
+                language_map[repo] = r.json().get("language") or "Unknown"
+            else:
+                language_map[repo] = "Unknown"
+        except Exception:
+            language_map[repo] = "Unknown"
+
+    log.info("Language enrichment complete")
+    return language_map
+
+def write_weekly_metrics(df_weekly,language_map=None):
     """
     Write weekly aggregated metrics to HBase weekly_metrics table.
 
@@ -71,9 +98,10 @@ def write_weekly_metrics(df_weekly):
         velocity   = str(row["velocity"]    or 0)
 
         row_key = f"{week}#{repo_name}".encode("utf-8")
-
+        language = language_map.get(repo_name, "Unknown") if language_map else "Unknown"
         table.put(row_key, {
             b"repo:name":       repo_name.encode("utf-8"),
+            b"repo:language":   language.encode("utf-8"),
             b"stats:stars":     stars.encode("utf-8"),
             b"stats:forks":     forks.encode("utf-8"),
             b"stats:velocity":  velocity.encode("utf-8"),
@@ -216,13 +244,18 @@ def main():
     log.info("Weekly aggregation complete")
     weekly_with_velocity.show(10, truncate=False)
 
-    # ── Write to HBase ─────────────────────────────────────────
-    write_weekly_metrics(weekly_with_velocity)
+    # ── Get top 200 repos by velocity ─────────────────────────
 
-    # ── ML predictions — top 200 repos only ───────────────────
     top_repos = weekly_with_velocity.orderBy(
         desc("velocity")
     ).limit(200)
+    language_map = enrich_with_language(top_repos, spark)
+
+    # ── Write to HBase ─────────────────────────────────────────
+    write_weekly_metrics(weekly_with_velocity, language_map)
+
+    # ── ML predictions — top 200 repos only ───────────────────
+  
 
     write_ml_predictions(top_repos)
 

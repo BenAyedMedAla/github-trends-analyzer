@@ -71,6 +71,24 @@ def build_headers() -> dict:
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
     return headers
 
+# Cache to avoid calling GitHub API for the same repo twice
+repo_language_cache = {}
+
+def get_repo_language(repo_name: str) -> str:
+    """Fetch language for a repo from GitHub API with caching."""
+    if repo_name in repo_language_cache:
+        return repo_language_cache[repo_name]
+    try:
+        url = f"https://api.github.com/repos/{repo_name}"
+        response = requests.get(
+            url, headers=build_headers(), timeout=5)
+        if response.status_code == 200:
+            lang = response.json().get("language") or "Unknown"
+            repo_language_cache[repo_name] = lang
+            return lang
+    except Exception:
+        pass
+    return "Unknown"
 
 def resolve_fork(event: dict) -> str:
     """
@@ -155,11 +173,13 @@ def process_and_publish(producer: KafkaProducer):
         canonical_repo = resolve_fork(event)
 
         # Build the message we send to Kafka
+        language = get_repo_language(canonical_repo)
         message = {
             "event_id":   event_id,
             "event_type": event_type,
             "repo_name":  canonical_repo,
             "actor":      event.get("actor", {}).get("login", "unknown"),
+            "language":   language,
             "created_at": event.get("created_at", ""),
         }
 
