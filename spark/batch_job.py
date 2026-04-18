@@ -17,6 +17,7 @@ import os
 import sys
 import happybase
 import logging
+from pathlib import Path
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
@@ -26,7 +27,9 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.types import StructType, StructField, StringType
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR.parent / ".env")
+load_dotenv(BASE_DIR / ".env")
 
 # ── Configuration ─────────────────────────────────────────────
 HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
@@ -60,7 +63,10 @@ def enrich_with_language(df_top, spark):
     log.info(f"Fetching language for {len(repo_names)} repos...")
 
     language_map = {}
-    headers = {"Authorization": f"token {os.getenv('GITHUB_TOKEN', '')}"}
+    headers = {
+    "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+    "Accept": "application/vnd.github+json"
+}
 
     for repo in repo_names:
         try:
@@ -69,8 +75,10 @@ def enrich_with_language(df_top, spark):
                 headers=headers, timeout=5)
             if r.status_code == 200:
                 language_map[repo] = r.json().get("language") or "Unknown"
+                print(f"Enriched {repo} with language: {language_map[repo]}")
             else:
                 language_map[repo] = "Unknown"
+                print(f"Failed to fetch {repo}: {r.status_code} - {r.text}")
         except Exception:
             language_map[repo] = "Unknown"
 

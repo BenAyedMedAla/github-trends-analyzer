@@ -52,6 +52,7 @@ services:
       - KAFKA_TOPIC=github-events
       - HBASE_HOST=hadoop-master
       - HDFS_HOST=hadoop-master:9000
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
     volumes:
       - ./spark:/app              # your .py job files
       - ./data/gharchive:/data/gharchive  # batch input files
