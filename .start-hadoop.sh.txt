@@ -1,3 +1,18 @@
+docker run -itd --net=hadoop \
+  -p 9870:9870 -p 8088:8088 -p 7077:7077 \
+  -p 16010:16010 -p 9092:9092 -p 16000:16000 \
+  --name hadoop-master --hostname hadoop-master \
+  liliasfaxi/hadoop-cluster:latest
+
+docker run -itd --net=hadoop -p 8040:8042 \
+  --name hadoop-worker1 --hostname hadoop-worker1 \
+  liliasfaxi/hadoop-cluster:latest
+
+docker run -itd --net=hadoop -p 8041:8042 \
+  --name hadoop-worker2 --hostname hadoop-worker2 \
+  liliasfaxi/hadoop-cluster:latest
+
+
 ./start-hadoop.sh
 ./start-kafka-zookeeper.sh ( usually x2 until you see kafka in jps)
 start-hbase.sh
