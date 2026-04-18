@@ -10,3 +10,11 @@ hbase-daemon.sh start thrift
 # Download 1 hour of data (~50MB)
 curl -o data/gharchive/2024-01-15-14.json.gz https://data.gharchive.org/2024-01-15-14.json.gz
 
+
+PS C:\Users\user\OneDrive\Bureau\github-trends-analyzer> docker cp data/gharchive/2024-01-15-14.json.gz hadoop-master:/root/2024-01-15-14.json.gz
+Successfully copied 138MB to hadoop-master:/root/2024-01-15-14.json.gz
+PS C:\Users\user\OneDrive\Bureau\github-trends-analyzer>  docker exec hadoop-master bash -c "hdfs dfs -put /root/2024-01-15-14.json.gz /user/root/gharchive/"
+PS C:\Users\user\OneDrive\Bureau\github-trends-analyzer> docker exec hadoop-master bash -c "hdfs dfs -ls /user/root/gharchive/"    
+Found 1 items
+-rw-r--r--   2 root supergroup  137767498 2026-04-18 14:34 /user/root/gharchive/2024-01-15-14.json.gz
+PS C:\Users\user\OneDrive\Bureau\github-trends-analyzer> docker exec opentrend-spark spark-submit --master local[*] /app/batch_job.py 

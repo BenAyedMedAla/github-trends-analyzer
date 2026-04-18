@@ -1,8 +1,7 @@
 version: "3.8"
 
 # ─────────────────────────────────────────────────────────────
-# opentrend — custom services
-#
+# opentrend — custom services*#
 # The prof's 3 containers (hadoop-master, hadoop-worker1,
 # hadoop-worker2) are started separately with docker run.
 # This file only manages the 3 containers YOU build.
