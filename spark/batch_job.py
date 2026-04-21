@@ -18,6 +18,7 @@ import sys
 import happybase
 import logging
 from pathlib import Path
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
@@ -51,6 +52,11 @@ def get_hbase_connection():
         port=HBASE_PORT,
         timeout=10000
     )
+
+
+def build_repo_key(repo_name: str) -> bytes:
+    """Build a deterministic, collision-safe repo key used across HBase tables."""
+    return quote(repo_name, safe="").encode("utf-8")
 
 def enrich_with_language(df_top, spark):
     """
@@ -104,12 +110,14 @@ def write_weekly_metrics(df_weekly,language_map=None):
         stars      = str(row["star_count"]  or 0)
         forks      = str(row["fork_count"]  or 0)
         velocity   = str(row["velocity"]    or 0)
+        repo_key   = build_repo_key(repo_name)
 
         row_key = f"{week}#{repo_name}".encode("utf-8")
         language = language_map.get(repo_name, "Unknown") if language_map else "Unknown"
         table.put(row_key, {
             b"repo:name":       repo_name.encode("utf-8"),
             b"repo:language":   language.encode("utf-8"),
+            b"repo:key":        repo_key,
             b"stats:stars":     stars.encode("utf-8"),
             b"stats:forks":     forks.encode("utf-8"),
             b"stats:velocity":  velocity.encode("utf-8"),
@@ -142,6 +150,7 @@ def write_ml_predictions(df_predictions):
         repo_name = row["repo_name"] or "unknown"
         velocity  = row["velocity"]  or 0
         stars     = row["star_count"] or 0
+        repo_key  = build_repo_key(repo_name)
 
         # Simple trending probability score (0.0 to 1.0)
         if velocity > 10:
@@ -164,6 +173,7 @@ def write_ml_predictions(df_predictions):
 
         table.put(row_key, {
             b"repo:name":            repo_name.encode("utf-8"),
+            b"repo:key":             repo_key,
             b"ml:probability":       str(probability).encode("utf-8"),
             b"ml:cluster":           cluster.encode("utf-8"),
             b"ml:predicted_growth":  str(predicted_growth).encode("utf-8"),

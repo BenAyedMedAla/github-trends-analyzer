@@ -50,6 +50,7 @@ services:
       - YARN_CONF_DIR=/etc/hadoop
       - KAFKA_HOST=hadoop-master:9092
       - KAFKA_TOPIC=github-events
+      - STREAM_CHECKPOINT=hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v3
       - HBASE_HOST=hadoop-master
       - HDFS_HOST=hadoop-master:9000
       - GITHUB_TOKEN=${GITHUB_TOKEN}
@@ -109,3 +110,18 @@ services:
       - ./frontend/src:/app/src   # live reload during development
     depends_on:
       - backend
+
+  # ── 5. HBASE EXPLORER (STREAMLIT) ────────────────────────
+  streamlit:
+    build: ./streamlit_app
+    container_name: opentrend-streamlit
+    restart: unless-stopped
+    networks:
+      - hadoop
+    ports:
+      - "8501:8501"
+    environment:
+      - HBASE_HOST=hadoop-master
+      - HBASE_PORT=9090
+      - STREAMLIT_DEFAULT_LIMIT=50
+    depends_on: []

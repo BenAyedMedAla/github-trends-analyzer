@@ -72,23 +72,34 @@ def build_headers() -> dict:
     return headers
 
 # Cache to avoid calling GitHub API for the same repo twice
-repo_language_cache = {}
+repo_metadata_cache = {}
 
-def get_repo_language(repo_name: str) -> str:
-    """Fetch language for a repo from GitHub API with caching."""
-    if repo_name in repo_language_cache:
-        return repo_language_cache[repo_name]
+def get_repo_metadata(repo_name: str) -> dict:
+    """Fetch repo metadata from GitHub API with caching."""
+    if repo_name in repo_metadata_cache:
+        return repo_metadata_cache[repo_name]
     try:
         url = f"https://api.github.com/repos/{repo_name}"
         response = requests.get(
             url, headers=build_headers(), timeout=5)
         if response.status_code == 200:
-            lang = response.json().get("language") or "Unknown"
-            repo_language_cache[repo_name] = lang
-            return lang
+            data = response.json()
+            metadata = {
+                "language": data.get("language") or "Unknown",
+                "stars_count": data.get("stargazers_count") or 0,
+                "forks_count": data.get("forks_count") or 0,
+                "watchers_count": data.get("watchers_count") or 0,
+            }
+            repo_metadata_cache[repo_name] = metadata
+            return metadata
     except Exception:
         pass
-    return "Unknown"
+    return {
+        "language": "Unknown",
+        "stars_count": 0,
+        "forks_count": 0,
+        "watchers_count": 0,
+    }
 
 def resolve_fork(event: dict) -> str:
     """
@@ -173,13 +184,16 @@ def process_and_publish(producer: KafkaProducer):
         canonical_repo = resolve_fork(event)
 
         # Build the message we send to Kafka
-        language = get_repo_language(canonical_repo)
+        metadata = get_repo_metadata(canonical_repo)
         message = {
             "event_id":   event_id,
             "event_type": event_type,
             "repo_name":  canonical_repo,
             "actor":      event.get("actor", {}).get("login", "unknown"),
-            "language":   language,
+            "language":   metadata["language"],
+            "stars_count": metadata["stars_count"],
+            "forks_count": metadata["forks_count"],
+            "watchers_count": metadata["watchers_count"],
             "created_at": event.get("created_at", ""),
         }
 
