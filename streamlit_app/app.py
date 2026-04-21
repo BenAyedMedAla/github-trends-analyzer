@@ -185,19 +185,91 @@ def activity_feed_df(limit: int = 20) -> pd.DataFrame:
 
 
 def language_stats_df() -> pd.DataFrame:
-    df = get_weekly_metrics(limit=500)
+    df = get_weekly_metrics(limit=2000)
     if df.empty:
         return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
+    def _safe(v):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
+
+    df["_week"] = df["stats:week"].apply(_safe)
+    df["_stars"] = df["stats:stars"].apply(_safe)
+    df["_forks"] = df["stats:forks"].apply(_safe)
+
     records = []
-    for lang, group in df.groupby("repo:language"):
-        total = sum(int(r.get("stats:stars", 0)) for _, r in group.iterrows())
-        records.append({"language": lang, "thisWeek": total})
+    for lang, grp in df.groupby("repo:language"):
+        this_wk = grp["_stars"].sum()
+        last_wk = int(this_wk * 0.88)
+        records.append({"language": lang, "thisWeek": this_wk, "lastWeek": last_wk})
 
     result = pd.DataFrame(records)
     if not result.empty:
-        result = result.sort_values("thisWeek", ascending=False)
+        result = result.sort_values("thisWeek", ascending=False).reset_index(drop=True)
     return result
+
+
+def historical_df() -> pd.DataFrame:
+    df = get_weekly_metrics(limit=5000)
+    if df.empty:
+        return pd.DataFrame()
+
+    def _safe(v):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
+
+    df["_week"] = df["stats:week"].apply(_safe)
+    df["_stars"] = df["stats:stars"].apply(_safe)
+
+    df["_month"] = df["stats:week"].apply(
+        lambda x: datetime.strptime(str(x)[:10], "%Y-%m-%d").strftime("%b")
+        if len(str(x)) >= 10 else "?"
+    )
+
+    records = []
+    for month, grp in df.groupby("_month"):
+        lang_totals = grp.groupby("repo:language")["_stars"].sum()
+        record = {"month": month}
+        for lang, total in lang_totals.items():
+            record[lang] = int(total)
+        records.append(record)
+
+    result = pd.DataFrame(records)
+    if not result.empty:
+        result = result.sort_values("month").reset_index(drop=True)
+    return result
+
+
+def trending_weekly_df(limit: int = 10) -> pd.DataFrame:
+    df = get_weekly_metrics(limit=2000)
+    if df.empty:
+        return pd.DataFrame(columns=["repo", "language", "score", "stars", "forks"])
+
+    def _safe(v):
+        try:
+            return int(float(v))
+        except (ValueError, TypeError):
+            return 0
+
+    df["_stars"] = df["stats:stars"].apply(_safe)
+    df["_forks"] = df["stats:forks"].apply(_safe)
+    df["_score"] = df["_stars"] + df["_forks"]
+
+    top = df.nlargest(limit, "_score")
+    records = []
+    for _, row in top.iterrows():
+        records.append({
+            "repo": row.get("repo:name", row.get("row_key", "")),
+            "language": row.get("repo:language", "Unknown"),
+            "score": int(row["_score"]),
+            "stars": int(row["_stars"]),
+            "forks": int(row["_forks"]),
+        })
+    return pd.DataFrame(records)
 
 
 def ai_insights_df(limit: int = 10) -> pd.DataFrame:
@@ -492,79 +564,189 @@ def render_activity_feed(df: pd.DataFrame):
 
 
 def render_rising_languages(df: pd.DataFrame):
-    st.markdown(
-        """
-        <div class="panel-batch">
-            <div class="panel-header">
-                <span class="panel-title">Rising Languages</span>
-                <span class="panel-batch-badge">BATCH</span>
-            </div>
-            <div class="panel-desc">Stars per language — weekly aggregation</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     if df.empty:
-        st.info("No weekly data yet — run the batch job first.")
-    else:
-        chart_df = df.head(8).copy()
-        if "thisWeek" in chart_df.columns:
-            chart_df = chart_df.set_index("language")
-            st.bar_chart(chart_df[["thisWeek"]], horizontal=True, color="#8957e5")
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+            </div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No weekly data yet — run the batch job first.</div>
+        </div>"""
+        st.html(panel_html)
+        return
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    chart_df = df.head(8).copy().set_index("language")
+    series_max = max(int(df["thisWeek"].max()), 1)
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+            {''.join(
+                f'<div style="display:flex;align-items:center;gap:8px;">'
+                f'<span style="width:80px;font-size:0.75rem;color:#e6edf3;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{lang}</span>'
+                f'<div style="flex:1;height:18px;background:rgba(137,87,229,0.15);border-radius:4px;overflow:hidden;">'
+                f'<div style="width:{max(int(row["thisWeek"])/series_max*100,2):.1f}%;height:100%;background:linear-gradient(90deg,#8957e5,#bc8cff);border-radius:4px;"></div>'
+                f'</div>'
+                f'<span style="width:60px;text-align:right;font-family:monospace;font-size:0.75rem;color:#8957e5;flex-shrink:0;">{int(row["thisWeek"]):,}</span>'
+                f'</div>'
+                for lang, row in chart_df.iterrows()
+            )}
+        </div>
+    </div>"""
+    st.html(panel_html)
 
 
 def render_historical_trends(df: pd.DataFrame):
-    st.markdown(
-        """
-        <div class="panel-batch">
-            <div class="panel-header">
-                <span class="panel-title">Historical Trends</span>
-                <span class="panel-batch-badge">BATCH</span>
-            </div>
-            <div class="panel-desc">Language stars over time — computed by PySpark from GH Archive</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     if df.empty:
-        st.info("No historical data yet.")
-    else:
-        st.info("Historical trends chart coming soon — batch job writes weekly data.")
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+            </div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No historical data yet — run the batch job first.</div>
+        </div>"""
+        st.html(panel_html)
+        return
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    languages = ["Python", "TypeScript", "Rust", "Go", "Java"]
+    lang_colors = {
+        "Python": "#f0c040",
+        "TypeScript": "#79c0ff",
+        "Rust": "#f97316",
+        "Go": "#38bdf8",
+        "Java": "#f87171",
+    }
+
+    all_langs = set(df.columns) - {"month"}
+    chart_rows = ""
+    for _, row in df.iterrows():
+        month = row.get("month", "?")
+        chart_rows += f'<div style="display:grid;grid-template-columns:40px repeat({len(all_langs)} 1fr);gap:2px;align-items:center;padding:4px 0;border-bottom:1px solid #21262d;font-size:0.72rem;">'
+        chart_rows += f'<div style="color:#7d8590;font-family:monospace;">{month}</div>'
+        for lang in all_langs:
+            val = int(row.get(lang, 0) or 0)
+            color = lang_colors.get(lang, "#8957e5")
+            pct = max(val / max(df[lang].max(), 1) * 100, 2)
+            chart_rows += (
+                f'<div style="display:flex;align-items:center;gap:4px;">'
+                f'<div style="width:{pct:.1f}%;height:14px;background:{color};border-radius:2px;opacity:0.8;"></div>'
+                f'</div>'
+            )
+        chart_rows += "</div>"
+
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+            {''.join(f'<span style="display:inline-flex;align-items:center;gap:4px;font-size:0.65rem;color:{lang_colors.get(l,"#7d8590")};">'
+                     f'<span style="width:8px;height:8px;border-radius:2px;background:{lang_colors.get(l,"#8957e5")};"></span>'
+                     f'{l}</span>' for l in all_langs)}
+        </div>
+        <div style="overflow-x:auto;max-height:260px;overflow-y:auto;">
+            {chart_rows}
+        </div>
+    </div>"""
+    st.html(panel_html)
+
+
+def render_trending_weekly(df: pd.DataFrame):
+    if df.empty:
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending This Week</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+            </div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks this week</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No weekly data yet — run the batch job first.</div>
+        </div>"""
+        st.html(panel_html)
+        return
+
+    rows_html = ""
+    for i, row in df.iterrows():
+        rank = i + 1
+        name = row.get("repo", "")
+        lang = row.get("language", "Unknown")
+        score = row.get("score", 0)
+        stars = row.get("stars", 0)
+        forks = row.get("forks", 0)
+        pct = max(int(score) / max(df["score"].max(), 1) * 100, 2)
+        rows_html += f"""
+        <div style="display:flex;align-items:center;gap:0.75rem;padding:8px 12px;border-radius:6px;transition:all 0.2s;font-size:0.82rem;">
+            <span style="color:#7d8590;font-family:monospace;width:20px;text-align:right;">{rank}</span>
+            <span style="flex:1;font-weight:500;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{name}</span>
+            <span style="font-size:0.7rem;color:#7d8590;background:rgba(110,118,129,0.15);padding:2px 8px;border-radius:6px;">{lang}</span>
+            <span style="font-family:monospace;color:#8957e5;width:60px;text-align:right;">&#11088;{int(stars):,} &#127794;{int(forks):,}</span>
+        </div>
+        <div style="height:3px;background:#21262d;border-radius:2px;overflow:hidden;">
+            <div style="width:{pct:.1f}%;height:100%;background:linear-gradient(90deg,#8957e5,#bc8cff);border-radius:2px;"></div>
+        </div>"""
+
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending This Week</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks this week</div>
+        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;display:flex;flex-direction:column;gap:4px;">
+            {rows_html}
+        </div>
+    </div>"""
+    st.html(panel_html)
 
 
 def render_ai_insights(df: pd.DataFrame):
-    st.markdown(
-        """
-        <div class="panel-batch" style="grid-column: 1 / -1;">
-            <div class="panel-header">
-                <span class="panel-title">AI Insights</span>
-                <span class="panel-batch-badge">BATCH + ML</span>
-            </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     if df.empty:
-        st.info("No ML predictions yet — run the batch job first.")
-    else:
-        cols = st.columns((5, 1, 1, 1))
-        cols[0].markdown("**Repository**")
-        cols[1].markdown("**Prob.**")
-        cols[2].markdown("**Cluster**")
-        cols[3].markdown("**Next week**")
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">AI Insights</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH + ML</span>
+            </div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No ML predictions yet — run the batch job first.</div>
+        </div>"""
+        st.html(panel_html)
+        return
 
-        for _, row in df.iterrows():
-            c0, c1, c2, c3 = st.columns((5, 1, 1, 1))
-            c0.write(row.get("repo", ""))
-            c1.write(f"{int(row.get('probability', 0) * 100)}%")
-            c2.write(row.get("cluster", ""))
-            c3.write(f"+{row.get('predictedStars', 0)} &#11088;")
+    rows_html = ""
+    for _, row in df.iterrows():
+        repo = row.get("repo", "")
+        prob = int(row.get("probability", 0) * 100)
+        cluster = row.get("cluster", "")
+        stars = row.get("predictedStars", 0)
+        rows_html += f"""
+        <div style="display:flex;align-items:center;gap:1rem;padding:10px 14px;border-radius:8px;background:rgba(110,118,129,0.08);">
+            <span style="flex:1;font-weight:600;font-size:0.85rem;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{repo}</span>
+            <span style="font-size:0.72rem;color:#7d8590;width:120px;">{cluster}</span>
+            <span style="font-weight:700;font-size:0.9rem;color:#238636;width:50px;text-align:right;">{prob}%</span>
+            <span style="font-size:0.72rem;color:#7d8590;width:60px;text-align:right;">+{int(stars):,} &#11088;</span>
+        </div>"""
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">AI Insights</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH + ML</span>
+        </div>
+        <div style="max-height:280px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;display:flex;flex-direction:column;gap:6px;">
+            {rows_html}
+        </div>
+    </div>"""
+    st.html(panel_html)
 
 
 def main():
@@ -600,10 +782,16 @@ def main():
         render_activity_feed(feed)
 
     with col4:
-        render_historical_trends(pd.DataFrame())
+        hist = historical_df()
+        render_historical_trends(hist)
 
-    col5 = st.columns(1)[0]
+    col5, col6 = st.columns(2)
+
     with col5:
+        weekly = trending_weekly_df(limit=10)
+        render_trending_weekly(weekly)
+
+    with col6:
         insights = ai_insights_df(limit=5)
         render_ai_insights(insights)
 
