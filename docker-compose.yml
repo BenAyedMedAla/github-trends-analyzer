@@ -120,6 +120,7 @@ services:
       - hadoop
     ports:
       - "8501:8501"
+      - "3000:8501"
     environment:
       - HBASE_HOST=hadoop-master
       - HBASE_PORT=9090

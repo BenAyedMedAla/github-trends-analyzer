@@ -21,7 +21,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, window, count, to_timestamp, max as spark_max
+from pyspark.sql.functions import col, from_json, window, count, to_timestamp, max as spark_max, unix_timestamp, lit
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
 load_dotenv()
@@ -85,6 +85,53 @@ def week_start_from_window(window_start: str) -> str:
     return monday.replace(hour=0, minute=0, second=0, microsecond=0).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
+
+
+def write_live_events(batch_df, batch_id):
+    """
+    Write individual events to live_events table for real-time activity feed.
+    Each row is one raw event — no window aggregation, just immediate write.
+    """
+    rows = batch_df.collect()
+    if not rows:
+        return
+
+    log.info(f"Live events batch {batch_id}: writing {len(rows)} individual events")
+
+    for i, row in enumerate(rows):
+        connection = None
+        try:
+            connection = get_hbase_connection()
+            table = connection.table("live_events")
+
+            repo_name  = str(row["repo_name"])   if row["repo_name"]   else "unknown"
+            event_type = str(row["event_type"])   if row["event_type"]   else "unknown"
+            language  = str(row["language"])  if row["language"]   else "Unknown"
+            repo_key  = build_repo_key(repo_name)
+
+            ts_val = row["event_timestamp"]
+            if ts_val:
+                ts_str = ts_val.strftime("%Y%m%d%H%M%S")
+            else:
+                ts_str = "none"
+
+            row_key = f"{ts_str}#{batch_id:04d}#{i:04d}#{repo_name}#{event_type}".encode("utf-8")
+
+            table.put(row_key, {
+                b"event:repo":     repo_name.encode("utf-8"),
+                b"event:type":     event_type.encode("utf-8"),
+                b"event:language": language.encode("utf-8"),
+                b"event:key":     repo_key,
+            })
+
+            log.info(f"Live events batch {batch_id} row {i}: written OK")
+        except Exception as e:
+            import traceback
+            log.error(f"Live events batch {batch_id} row {i}: write failed — {e}")
+            log.error(traceback.format_exc())
+        finally:
+            if connection is not None:
+                connection.close()
 
 
 def write_to_hbase(batch_df, batch_id):
@@ -248,6 +295,20 @@ def main():
         .start()
     )
 
+    # ── Parallel live-events stream (no window aggregation) ─────────
+    # Write individual raw events immediately for real-time activity feed.
+    # Uses a separate checkpoint so it can run independently.
+    live_events_stream = (
+        parsed.writeStream
+        .outputMode("append")
+        .foreachBatch(write_live_events)
+        .option("checkpointLocation", CHECKPOINT + "/live-events")
+        .trigger(processingTime="10 seconds")
+        .start()
+    )
+
+    log.info("Live events stream started")
+
     log.info("Streaming query started — waiting for events...")
     log.info("Press Ctrl+C to stop")
 
@@ -256,6 +317,7 @@ def main():
     except KeyboardInterrupt:
         log.info("Stopping streaming job...")
         query.stop()
+        live_events_stream.stop()
         spark.stop()
 
 

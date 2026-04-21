@@ -1,15 +1,19 @@
 import os
 import socket
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
 
 import happybase
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(page_title="GitHub Trends Analyzer", page_icon="data", layout="wide")
+
 HBASE_HOST = os.getenv("HBASE_HOST", "hadoop-master")
 HBASE_PORT = int(os.getenv("HBASE_PORT", "9090"))
-DEFAULT_LIMIT = int(os.getenv("STREAMLIT_DEFAULT_LIMIT", "50"))
+DEFAULT_LIMIT = int(os.getenv("STREAMLIT_DEFAULT_LIMIT", "100"))
+REFRESH_INTERVAL = int(os.getenv("STREAMLIT_REFRESH_SECONDS", "5"))
 
 
 def get_connection() -> happybase.Connection:
@@ -53,10 +57,11 @@ def scan_rows(
         try:
             table = conn.table(table_name)
             rows = table.scan(row_prefix=prefix_bytes, limit=limit, reverse=latest_first)
-
             result: List[Tuple[str, Dict[str, str]]] = []
             for row_key, cells in rows:
-                result.append((row_key.decode("utf-8", errors="ignore"), decode_cell_map(cells)))
+                result.append(
+                    (row_key.decode("utf-8", errors="ignore"), decode_cell_map(cells))
+                )
             return result
         finally:
             conn.close()
@@ -89,56 +94,521 @@ def rows_to_dataframe(rows: List[Tuple[str, Dict[str, str]]]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def main() -> None:
-    st.set_page_config(page_title="HBase Explorer", page_icon="data", layout="wide")
-    st.title("OpenTrend HBase Explorer")
-    st.caption("Inspect live and batch tables directly from HBase.")
+def get_live_metrics(limit: int = 20) -> pd.DataFrame:
+    try:
+        rows = scan_rows("live_metrics", limit=limit, latest_first=True)
+    except Exception:
+        return pd.DataFrame()
+    return rows_to_dataframe(rows)
+
+
+def get_live_events(limit: int = 30) -> pd.DataFrame:
+    try:
+        rows = scan_rows("live_events", limit=limit, latest_first=True)
+    except Exception:
+        return pd.DataFrame()
+    return rows_to_dataframe(rows)
+
+
+def get_weekly_metrics(limit: int = 200) -> pd.DataFrame:
+    try:
+        rows = scan_rows("weekly_metrics", limit=limit, latest_first=True)
+    except Exception:
+        return pd.DataFrame()
+    return rows_to_dataframe(rows)
+
+
+def get_ml_predictions(limit: int = 20) -> pd.DataFrame:
+    try:
+        rows = scan_rows("ml_predictions", limit=limit, latest_first=False)
+    except Exception:
+        return pd.DataFrame()
+    return rows_to_dataframe(rows)
+
+
+def trending_repos_df(limit: int = 8) -> pd.DataFrame:
+    df = get_live_metrics(limit=limit)
+    if df.empty:
+        return pd.DataFrame(columns=["repo", "language", "stars"])
+
+    if "repo:name" not in df.columns:
+        return pd.DataFrame(columns=["repo", "language", "stars"])
+
+    repo_stars: Dict[str, int] = {}
+    repo_lang: Dict[str, str] = {}
+
+    for _, row in df.iterrows():
+        name = str(row.get("repo:name", ""))
+        lang = str(row.get("repo:language", "Unknown"))
+        try:
+            stars = int(row.get("repo:stars", 0))
+        except (ValueError, TypeError):
+            stars = 0
+        if name:
+            repo_stars[name] = max(repo_stars.get(name, 0), stars)
+            if name not in repo_lang:
+                repo_lang[name] = lang
+
+    sorted_repos = sorted(repo_stars.items(), key=lambda x: x[1], reverse=True)[:limit]
+    records = [
+        {"repo": name, "language": repo_lang.get(name, "Unknown"), "stars": stars}
+        for name, stars in sorted_repos
+    ]
+    return pd.DataFrame(records)
+
+
+def activity_feed_df(limit: int = 20) -> pd.DataFrame:
+    df = get_live_events(limit=limit)
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp", "type", "repo"])
+
+    records = []
+    for _, row in df.iterrows():
+        row_key = row.get("row_key", "")
+        parts = row_key.split("#", 2)
+        ts = parts[0] if len(parts) > 0 else ""
+        try:
+            from datetime import timezone, timedelta
+            utc_dt = datetime.strptime(ts, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+            local = utc_dt + timedelta(hours=1)
+            ts_disp = local.strftime("%H:%M:%S")
+        except Exception:
+            ts_disp = f"{ts[8:10]}:{ts[10:12]}:{ts[12:14]}" if len(ts) >= 14 else ts
+
+        records.append({
+            "timestamp": ts_disp,
+            "type": row.get("event:type", "Event"),
+            "repo": row.get("event:repo", ""),
+        })
+
+    return pd.DataFrame(records)
+
+
+def language_stats_df() -> pd.DataFrame:
+    df = get_weekly_metrics(limit=500)
+    if df.empty:
+        return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
+
+    records = []
+    for lang, group in df.groupby("repo:language"):
+        total = sum(int(r.get("stats:stars", 0)) for _, r in group.iterrows())
+        records.append({"language": lang, "thisWeek": total})
+
+    result = pd.DataFrame(records)
+    if not result.empty:
+        result = result.sort_values("thisWeek", ascending=False)
+    return result
+
+
+def ai_insights_df(limit: int = 10) -> pd.DataFrame:
+    df = get_ml_predictions(limit=limit)
+    if df.empty:
+        return pd.DataFrame(columns=["repo", "probability", "cluster", "predictedStars"])
+
+    records = []
+    for _, row in df.iterrows():
+        prob = float(row.get("ml:probability", 0))
+        records.append({
+            "repo": row.get("repo:name", row.get("row_key", "")),
+            "probability": prob,
+            "cluster": row.get("ml:cluster", "Unknown"),
+            "predictedStars": int(float(row.get("ml:predicted_growth", 0))),
+        })
+
+    return pd.DataFrame(records)
+
+
+def render_live_badge(streaming: bool = True) -> str:
+    if streaming:
+        return "LIVE"
+    return "BATCH"
+
+
+CSS = """
+<style>
+    @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap");
+
+    [data-testid="stAppViewContainer"] { background: #0d1117; color: #e6edf3; }
+    [data-testid="stHeader"] { background: #0d1117; border-bottom: 1px solid #21262d; }
+    [data-testid="stMainBlockContainer"] { padding-top: 1rem; }
+
+    .panel-stream {
+        background: #161b22;
+        border: 2px solid #238636;
+        border-radius: 8px;
+        padding: 1rem;
+        position: relative;
+        box-shadow: 0 0 12px rgba(35, 134, 54, 0.15);
+    }
+    .panel-stream::before {
+        content: "";
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 2px;
+        background: linear-gradient(90deg, transparent, #238636, transparent);
+        animation: pulse-bar 2s ease-in-out infinite;
+    }
+    .panel-batch {
+        background: #161b22;
+        border: 1px solid #8957e5;
+        border-radius: 8px;
+        padding: 1rem;
+    }
+    .panel-live-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        font-family: "JetBrains Mono", monospace;
+        background: rgba(35, 134, 54, 0.15);
+        color: #238636;
+        padding: 2px 10px;
+        border-radius: 20px;
+        border: 1px solid rgba(35, 134, 54, 0.3);
+    }
+    .panel-live-badge::before {
+        content: "";
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: #238636;
+        animation: pulse-dot 1.5s ease-in-out infinite;
+    }
+    .panel-batch-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 0.7rem;
+        font-weight: 600;
+        font-family: "JetBrains Mono", monospace;
+        background: rgba(137, 87, 229, 0.15);
+        color: #8957e5;
+        padding: 2px 10px;
+        border-radius: 20px;
+        border: 1px solid rgba(137, 87, 229, 0.3);
+    }
+    .panel-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 0.75rem;
+    }
+    .panel-title {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #e6edf3;
+        font-family: "Inter", sans-serif;
+    }
+    .panel-desc {
+        font-size: 0.7rem;
+        color: #7d8590;
+        margin-bottom: 0.75rem;
+    }
+    .feed-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 6px 8px;
+        border-radius: 6px;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 0.72rem;
+        color: #e6edf3;
+        transition: background 0.15s;
+    }
+    .feed-row:hover { background: rgba(110, 118, 129, 0.12); }
+    .feed-container {
+        max-height: 340px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: #30363d #0d1117;
+    }
+    .feed-container::-webkit-scrollbar { width: 4px; }
+    .feed-container::-webkit-scrollbar-track { background: #0d1117; }
+    .feed-container::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+    .feed-row .ts { color: #7d8590; width: 70px; flex-shrink: 0; }
+    .feed-row .ev { width: 100px; flex-shrink: 0; color: #79c0ff; }
+    .feed-row .rp { flex: 1; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tr-row {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 0.82rem;
+        transition: all 0.2s;
+    }
+    .tr-row:hover { background: rgba(110, 118, 129, 0.1); }
+    .tr-row.flash-row { animation: flash-green 1.2s ease-out; }
+    @keyframes flash-green {
+        0%   { background: rgba(35, 134, 54, 0.4); }
+        100% { background: transparent; }
+    }
+    .tr-rank { color: #7d8590; font-family: "JetBrains Mono", monospace; width: 20px; text-align: right; }
+    .tr-name { flex: 1; font-weight: 500; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tr-lang { font-size: 0.7rem; color: #7d8590; background: rgba(110, 118, 129, 0.15); padding: 2px 8px; border-radius: 6px; }
+    .tr-stars { font-family: "JetBrains Mono", monospace; color: #238636; font-size: 0.82rem; }
+    .tr-container { max-height: 340px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
+    .tr-container::-webkit-scrollbar { width: 4px; }
+    .tr-container::-webkit-scrollbar-track { background: #161b22; }
+    .tr-container::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+    .insight-row {
+        display: flex;
+        align-items: center;
+        gap: 1rem;
+        padding: 10px 14px;
+        border-radius: 8px;
+        background: rgba(110, 118, 129, 0.08);
+    }
+    .insight-row .repo { flex: 1; min-width: 0; }
+    .insight-row .repo-name { font-weight: 600; font-size: 0.85rem; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .insight-row .cluster { font-size: 0.72rem; color: #7d8590; }
+    .insight-row .prob { font-weight: 700; font-size: 0.9rem; color: #238636; }
+    .insight-row .stars-next { font-size: 0.72rem; color: #7d8590; }
+    .site-header {
+        border-bottom: 1px solid #21262d;
+        padding: 0.75rem 1.5rem;
+        background: #0d1117;
+    }
+    .site-title { font-size: 1.2rem; font-weight: 800; color: #e6edf3; }
+    .site-subtitle { font-size: 0.7rem; color: #7d8590; margin-top: 2px; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
+    .status-dot-live { background: #238636; animation: pulse-dot 1.5s ease-in-out infinite; }
+    .status-dot-batch { background: #8957e5; }
+    @keyframes pulse-dot {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.3; }
+    }
+    @keyframes pulse-bar {
+        0% { opacity: 0.3; }
+        50% { opacity: 1; }
+        100% { opacity: 0.3; }
+    }
+    [data-testid="stHorizontalBlock"] > div { gap: 1rem; }
+    .stHorizontalBlock [data-testid="stVerticalBlock"] { padding: 0 !important; }
+</style>
+"""
+
+
+def render_header():
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="site-header">
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
+                <div>
+                    <div class="site-title">GitHub Trends Analyzer</div>
+                    <div class="site-subtitle">Real-time streaming + weekly batch pipeline dashboard</div>
+                </div>
+                <div style="display:flex;align-items:center;gap:1.5rem;">
+                    <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
+                        Stream: <span class="status-dot status-dot-live"></span> LIVE
+                    </span>
+                    <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
+                        Batch: <span class="status-dot status-dot-batch"></span> Last run weekly
+                    </span>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_trending_now(df: pd.DataFrame):
+    prev: set = set(st.session_state.get("prev_trending", []))
+    curr: set = set(df["repo"].tolist() if not df.empty else [])
+    new_repos: set = curr - prev
+    st.session_state["prev_trending"] = list(curr)
+
+    rows_html = ""
+    if df.empty:
+        rows_html = '<div style="padding:8px 12px;color:#7d8590;font-size:0.82rem;">No live metrics yet — waiting for stream...</div>'
+    else:
+        for i, row in df.iterrows():
+            rank = i + 1
+            name = row.get("repo", "")
+            lang = row.get("language", "Unknown")
+            stars = row.get("stars", 0)
+            is_new = name in new_repos
+            flash = "animation:flash-green 1.2s ease-out;" if is_new else ""
+            rows_html += f"""
+            <div style="{flash}display:flex;align-items:center;gap:0.75rem;padding:8px 12px;border-radius:6px;transition:all 0.2s;font-size:0.82rem;">
+                <span style="color:#7d8590;font-family:monospace;width:20px;text-align:right;">{rank}</span>
+                <span style="flex:1;font-weight:500;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{name}</span>
+                <span style="font-size:0.7rem;color:#7d8590;background:rgba(110,118,129,0.15);padding:2px 8px;border-radius:6px;">{lang}</span>
+                <span style="font-family:monospace;color:#238636;">&#11088; {stars}</span>
+            </div>"""
+
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #238636;border-radius:8px;padding:1rem;position:relative;box-shadow:0 0 12px rgba(35,134,54,0.15);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Now</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(35,134,54,0.15);color:#238636;padding:2px 10px;border-radius:20px;border:1px solid rgba(35,134,54,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#238636;animation:pulse-dot 1.5s ease-in-out infinite;"></span>
+                LIVE
+            </span>
+        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by star count in last window</div>
+        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;">
+            {rows_html}
+        </div>
+    </div>"""
+    st.html(panel_html)
+
+
+def render_activity_feed(df: pd.DataFrame):
+    rows_html = ""
+    if df.empty:
+        rows_html = '<div style="padding:8px 12px;color:#7d8590;font-size:0.72rem;">No events yet — waiting for stream...</div>'
+    else:
+        for _, row in df.iterrows():
+            ts = row.get("timestamp", "")
+            ev = row.get("type", "Event")
+            rp = row.get("repo", "")
+            display_ev = "&#11088; WatchEvent" if ev == "WatchEvent" else "&#127794; ForkEvent"
+            rows_html += f"""
+            <div style="display:flex;align-items:center;gap:0.75rem;padding:6px 8px;border-radius:6px;font-family:monospace;font-size:0.72rem;color:#e6edf3;transition:background 0.15s;">
+                <span style="color:#7d8590;width:70px;flex-shrink:0;">{ts}</span>
+                <span style="width:100px;flex-shrink:0;color:#79c0ff;">{display_ev}</span>
+                <span style="flex:1;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{rp}</span>
+            </div>"""
+
+    panel_html = f"""
+    <div style="background:#161b22;border:2px solid #238636;border-radius:8px;padding:1rem;position:relative;box-shadow:0 0 12px rgba(35,134,54,0.15);">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Live Activity Feed</h3>
+            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(35,134,54,0.15);color:#238636;padding:2px 10px;border-radius:20px;border:1px solid rgba(35,134,54,0.3);">
+                <span style="width:6px;height:6px;border-radius:50%;background:#238636;animation:pulse-dot 1.5s ease-in-out infinite;"></span>
+                LIVE
+            </span>
+        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Raw Kafka events — as they arrive</div>
+        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;">
+            {rows_html}
+        </div>
+    </div>"""
+    st.html(panel_html)
+
+
+def render_rising_languages(df: pd.DataFrame):
+    st.markdown(
+        """
+        <div class="panel-batch">
+            <div class="panel-header">
+                <span class="panel-title">Rising Languages</span>
+                <span class="panel-batch-badge">BATCH</span>
+            </div>
+            <div class="panel-desc">Stars per language — weekly aggregation</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if df.empty:
+        st.info("No weekly data yet — run the batch job first.")
+    else:
+        chart_df = df.head(8).copy()
+        if "thisWeek" in chart_df.columns:
+            chart_df = chart_df.set_index("language")
+            st.bar_chart(chart_df[["thisWeek"]], horizontal=True, color="#8957e5")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_historical_trends(df: pd.DataFrame):
+    st.markdown(
+        """
+        <div class="panel-batch">
+            <div class="panel-header">
+                <span class="panel-title">Historical Trends</span>
+                <span class="panel-batch-badge">BATCH</span>
+            </div>
+            <div class="panel-desc">Language stars over time — computed by PySpark from GH Archive</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if df.empty:
+        st.info("No historical data yet.")
+    else:
+        st.info("Historical trends chart coming soon — batch job writes weekly data.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_ai_insights(df: pd.DataFrame):
+    st.markdown(
+        """
+        <div class="panel-batch" style="grid-column: 1 / -1;">
+            <div class="panel-header">
+                <span class="panel-title">AI Insights</span>
+                <span class="panel-batch-badge">BATCH + ML</span>
+            </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if df.empty:
+        st.info("No ML predictions yet — run the batch job first.")
+    else:
+        cols = st.columns((5, 1, 1, 1))
+        cols[0].markdown("**Repository**")
+        cols[1].markdown("**Prob.**")
+        cols[2].markdown("**Cluster**")
+        cols[3].markdown("**Next week**")
+
+        for _, row in df.iterrows():
+            c0, c1, c2, c3 = st.columns((5, 1, 1, 1))
+            c0.write(row.get("repo", ""))
+            c1.write(f"{int(row.get('probability', 0) * 100)}%")
+            c2.write(row.get("cluster", ""))
+            c3.write(f"+{row.get('predictedStars', 0)} &#11088;")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def main():
+    st.title("")
+
+    refresh = st.sidebar.selectbox(
+        "Refresh rate",
+        [5, 10, 30, 60],
+        index=0,
+        format_func=lambda x: f"{x}s",
+    )
 
     with st.sidebar:
-        st.subheader("Connection")
-        st.write(f"Host: {HBASE_HOST}")
-        st.write(f"Port: {HBASE_PORT}")
+        st.caption(f"Connected to: {HBASE_HOST}:{HBASE_PORT}")
+        st.caption("Tables: live_events, live_metrics, repos, weekly_metrics, ml_predictions")
 
-        st.subheader("Query")
-        table_name = st.selectbox(
-            "Table",
-            ["live_metrics", "repos", "weekly_metrics", "ml_predictions"],
-            index=0,
-        )
-        limit = st.slider("Rows", min_value=10, max_value=200, value=DEFAULT_LIMIT, step=10)
-        latest_first = st.checkbox("Latest rows first", value=True)
-        row_prefix = st.text_input("Row key prefix", value="")
+    render_header()
 
-        run = st.button("Load rows", type="primary")
-
-    if not run:
-        st.info("Choose options in the sidebar, then click Load rows.")
-        return
-
-    try:
-        rows = scan_rows(
-            table_name=table_name,
-            limit=limit,
-            row_prefix=row_prefix,
-            latest_first=latest_first,
-        )
-    except Exception as exc:
-        st.error(f"Failed to read HBase: {exc}")
-        return
-
-    st.success(f"Loaded {len(rows)} rows from {table_name}")
-
-    df = rows_to_dataframe(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.subheader("Quick stats")
     col1, col2 = st.columns(2)
-    col1.metric("Rows loaded", len(rows))
-    col2.metric("Columns found", max(len(df.columns) - 1, 0))
 
-    if not df.empty:
-        st.subheader("Columns")
-        st.write(", ".join([c for c in df.columns if c != "row_key"]))
+    with col1:
+        trending = trending_repos_df(limit=8)
+        render_trending_now(trending)
+
+    with col2:
+        lang_stats = language_stats_df()
+        render_rising_languages(lang_stats)
+
+    col3, col4 = st.columns(2)
+
+    with col3:
+        feed = activity_feed_df(limit=20)
+        render_activity_feed(feed)
+
+    with col4:
+        render_historical_trends(pd.DataFrame())
+
+    col5 = st.columns(1)[0]
+    with col5:
+        insights = ai_insights_df(limit=5)
+        render_ai_insights(insights)
+
+    time.sleep(refresh)
+    st.rerun()
 
 
 if __name__ == "__main__":
