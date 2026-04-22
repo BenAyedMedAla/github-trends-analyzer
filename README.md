@@ -1,15 +1,15 @@
 # github-trends-analyzer
 > A lightweight big data pipeline that detects trending open-source repositories in real time using stream and batch processing.
  
-Built as a university big data project. Combines a live GitHub event stream with weekly historical analysis to surface which repositories are gaining momentum — right now and over time.
+Built as a university big data project. Combines a live GitHub event stream with daily historical analysis to surface which repositories are gaining momentum — right now and over time.
  
 ---
  
 ## What it does
  
 - **Stream side** — polls the GitHub Events API every 60 seconds, pushes events through Kafka, and uses Spark Structured Streaming to compute trending repositories in 10-minute windows
-- **Batch side** — reads weekly GitHub Archive data, runs PySpark to compute star velocity and rising languages, and scores repositories with a machine learning model
-- **Dashboard** — a streamlit app showing 6 live panels: trending now repos, rising languages, live event feed, historical trends, trending this week repos, and AI-predicted breakouts
+- **Batch side** — reads the previous day's GitHub Archive data every day at 02:00, runs PySpark to compute star velocity and rising languages, and scores repositories with a machine learning model
+- **Dashboard** — a streamlit app showing 6 live panels: trending now repos, rising languages, live event feed, historical trends, trending yesterday repos, and AI-predicted breakouts
  
 ---
  
@@ -161,23 +161,23 @@ docker compose --profile airflow up -d airflow
 Airflow UI: http://localhost:8080
 Default credentials: `admin` / `admin`
 
-### 8. Run the weekly batch manually from Airflow
+### 8. Run the daily batch manually from Airflow
 
 After Airflow starts, you can trigger the batch DAG from the UI or by command.
 
 Trigger from the Airflow UI:
 
-- open DAG `hdfs_weekly_batch`
+- open DAG `hdfs_daily_batch`
 - click `Trigger DAG`
 
 Trigger from the terminal:
 
 ```bash
-docker exec opentrend-airflow airflow dags trigger hdfs_weekly_batch
+docker exec opentrend-airflow airflow dags trigger hdfs_daily_batch
 ```
 
 The DAG will:
-- download the last 7 full days of GH Archive data
+- download the previous day GH Archive data only
 - upload them into HDFS at `/user/root/gharchive`
 - verify the HDFS input exists
 - run the Spark batch job
@@ -191,25 +191,25 @@ The batch job writes into HBase tables used by Streamlit:
 Check DAG runs:
 
 ```bash
-docker exec opentrend-airflow airflow dags list-runs -d hdfs_weekly_batch --no-backfill
+docker exec opentrend-airflow airflow dags list-runs -d hdfs_daily_batch --no-backfill
 ```
 
 Check task states for a specific run:
 
 ```bash
-docker exec opentrend-airflow airflow tasks states-for-dag-run hdfs_weekly_batch "manual__YYYY-MM-DDTHH:MM:SS+00:00"
+docker exec opentrend-airflow airflow tasks states-for-dag-run hdfs_daily_batch "manual__YYYY-MM-DDTHH:MM:SS+00:00"
 ```
 
 Tail the ingestion task log:
 
 ```bash
-docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_weekly_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=ingest_last_7_days_to_hdfs/attempt=1.log"
+docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_daily_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=ingest_previous_day_to_hdfs/attempt=1.log"
 ```
 
 Tail the Spark batch task log:
 
 ```bash
-docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_weekly_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=run_spark_batch/attempt=1.log"
+docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_daily_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=run_spark_batch/attempt=1.log"
 ```
 
 Watch Spark container output directly:
@@ -235,19 +235,21 @@ exit
 
 ### 10. Airflow orchestration details
 
-An example DAG is provided at `airflow/dags/hdfs_weekly_batch.py`.
+An example DAG is provided at `airflow/dags/hdfs_daily_batch.py`.
 
 It:
 - checks runtime dependency (`docker`)
-- downloads the last 7 full days of GH Archive data
+- downloads the previous day GH Archive data only
 - uploads downloaded files into `/user/root/gharchive` in HDFS
 - verifies HDFS input exists at `/user/root/gharchive`
-- triggers `spark-submit` in `opentrend-spark`
-- runs weekly on Monday at 02:00
+- triggers `spark-submit` in `opentrend-spark` (which processes previous day files only)
+- runs daily at 02:00
 
 Use Airflow as the single scheduler and remove duplicate schedulers.
 
-If you want a faster test run, set `GHARCHIVE_DAYS_BACK=1` in the Airflow container environment before starting Airflow. The default is `7`.
+The DAG is configured for previous-day processing by default.
+
+Optional override: set `BATCH_DAY=YYYY-MM-DD` in the Spark environment to backfill a specific day.
  
 | Service | URL |
 |---|---|
@@ -259,10 +261,10 @@ If you want a faster test run, set `GHARCHIVE_DAYS_BACK=1` in the Airflow contai
 | Panel | Source | Updates |
 |---|---|---|
 | Trending now | `live_metrics` | every 10 min via stream |
-| Rising languages | `weekly_metrics` | weekly via batch |
+| Rising languages | `weekly_metrics` | daily via batch |
 | Live activity feed | `events_stream` | every few seconds |
-| Historical trends | `weekly_metrics` | weekly via batch |
-| AI insights | `ml_predictions` | weekly via batch |
+| Historical trends | `weekly_metrics` | daily via batch |
+| AI insights | `ml_predictions` | daily via batch |
  
 ---
  

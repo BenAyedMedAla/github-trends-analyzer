@@ -6,14 +6,13 @@ from airflow.operators.bash import BashOperator
 
 
 gharchive_hdfs_path = os.getenv("GHARCHIVE_HDFS_PATH", "/user/root/gharchive")
-gharchive_days_back = int(os.getenv("GHARCHIVE_DAYS_BACK", "7"))
 retention_days = int(os.getenv("GHARCHIVE_RETENTION_DAYS", "30"))
 
 with DAG(
-    dag_id="hdfs_weekly_batch",
-    description="Run GHArchive weekly batch from HDFS into HBase",
+    dag_id="hdfs_daily_batch",
+    description="Run GHArchive daily batch from HDFS into HBase",
     start_date=datetime(2026, 1, 1),
-    schedule="0 2 * * 1",  # Every Monday 02:00
+    schedule="0 2 * * *",  # Every day at 02:00
     catchup=False,
     max_active_runs=1,
     default_args={
@@ -26,12 +25,11 @@ with DAG(
     tags=["opentrend", "hdfs", "spark"],
 ) as dag:
 
-    def build_ingest_command(hdfs_path: str, days_back: int) -> str:
+    def build_ingest_command(hdfs_path: str) -> str:
         return (
             "docker exec hadoop-master bash -lc '\n"
             "set -euo pipefail\n"
             f"hdfs_path={hdfs_path}\n"
-            f"days_back={days_back}\n"
             "verify_hdfs_gzip() {\n"
             "  local file_path=\"$1\"\n"
             "  hdfs dfs -cat \"$file_path\" 2>/dev/null | gzip -t 2>/dev/null\n"
@@ -43,7 +41,7 @@ with DAG(
             "valid_count=0\n"
             "skip_count=0\n"
             "download_count=0\n"
-            "for offset in $(seq 1 $days_back); do\n"
+            "for offset in 1; do\n"
             "  day=$(date -u -d \"-$offset day\" +%Y-%m-%d)\n"
             "  base_name=\"$day.json.gz\"\n"
             "  if hdfs dfs -test -e \"$hdfs_path/$base_name\"; then\n"
@@ -137,9 +135,9 @@ with DAG(
         bash_command="command -v docker >/dev/null 2>&1",
     )
 
-    ingest_last_n_days_to_hdfs = BashOperator(
-        task_id="ingest_last_n_days_to_hdfs",
-        bash_command=build_ingest_command(gharchive_hdfs_path, gharchive_days_back),
+    ingest_previous_day_to_hdfs = BashOperator(
+        task_id="ingest_previous_day_to_hdfs",
+        bash_command=build_ingest_command(gharchive_hdfs_path),
     )
 
     check_hdfs_input = BashOperator(
@@ -165,7 +163,7 @@ with DAG(
 
     (
         check_runtime_dependencies
-        >> ingest_last_n_days_to_hdfs
+        >> ingest_previous_day_to_hdfs
         >> check_hdfs_input
         >> run_spark_batch
         >> cleanup_old_hdfs_files

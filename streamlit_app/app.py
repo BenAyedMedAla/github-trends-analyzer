@@ -138,6 +138,14 @@ def get_weekly_metrics(limit: int = 200) -> pd.DataFrame:
     return df
 
 
+def get_batch_day_column(df: pd.DataFrame) -> Optional[str]:
+    if "stats:day" in df.columns:
+        return "stats:day"
+    if "stats:week" in df.columns:
+        return "stats:week"
+    return None
+
+
 def get_ml_predictions(limit: int = 20) -> pd.DataFrame:
     try:
         rows = scan_rows("ml_predictions", limit=limit, latest_first=False)
@@ -207,8 +215,9 @@ def activity_feed_df(limit: int = 20) -> pd.DataFrame:
 def language_stats_df() -> pd.DataFrame:
     # Use full weekly dataset so all batch panels are consistent.
     df = get_weekly_metrics(limit=0)
-    required_cols = {"stats:week", "stats:stars", "stats:forks", "repo:language"}
-    if df.empty or not required_cols.issubset(set(df.columns)):
+    date_col = get_batch_day_column(df)
+    required_cols = {"stats:stars", "stats:forks", "repo:language"}
+    if df.empty or date_col is None or not required_cols.issubset(set(df.columns)):
         return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
     def _safe(v):
@@ -217,9 +226,14 @@ def language_stats_df() -> pd.DataFrame:
         except (ValueError, TypeError):
             return 0
 
-    df["_week"] = df["stats:week"].apply(_safe)
+    parsed_days = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["_day"] = parsed_days
     df["_stars"] = df["stats:stars"].apply(_safe)
     df["_forks"] = df["stats:forks"].apply(_safe)
+    df = df[df["_day"].notna()]
+
+    if df.empty:
+        return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
     # Normalize language labels so empty values are still visible in charts.
     df["_language"] = df["repo:language"].apply(
@@ -231,23 +245,23 @@ def language_stats_df() -> pd.DataFrame:
     if non_unknown_count > 0:
         df = df[df["_language"] != "Unknown"]
 
-    weeks = sorted([w for w in df["_week"].unique() if w is not None])
-    if not weeks:
+    days = sorted([d for d in df["_day"].unique() if d is not None])
+    if not days:
         return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
-    current_week = weeks[-1]
-    previous_week = weeks[-2] if len(weeks) >= 2 else None
+    current_day = days[-1]
+    previous_day = days[-2] if len(days) >= 2 else None
 
     current = (
-        df[df["_week"] == current_week]
+        df[df["_day"] == current_day]
         .groupby("_language", as_index=False)["_stars"]
         .sum()
         .rename(columns={"_language": "language", "_stars": "thisWeek"})
     )
 
-    if previous_week is not None:
+    if previous_day is not None:
         previous = (
-            df[df["_week"] == previous_week]
+            df[df["_day"] == previous_day]
             .groupby("_language", as_index=False)["_stars"]
             .sum()
             .rename(columns={"_language": "language", "_stars": "lastWeek"})
@@ -268,8 +282,9 @@ def language_stats_df() -> pd.DataFrame:
 def historical_df() -> pd.DataFrame:
     # Use same complete dataset as language_stats_df for coherent charts.
     df = get_weekly_metrics(limit=0)
-    required_cols = {"stats:week", "stats:stars", "repo:language"}
-    if df.empty or not required_cols.issubset(set(df.columns)):
+    date_col = get_batch_day_column(df)
+    required_cols = {"stats:stars", "repo:language"}
+    if df.empty or date_col is None or not required_cols.issubset(set(df.columns)):
         return pd.DataFrame(columns=["day"])
 
     def _safe(v):
@@ -278,12 +293,13 @@ def historical_df() -> pd.DataFrame:
         except (ValueError, TypeError):
             return 0
 
-    df["_week"] = df["stats:week"].apply(_safe)
+    parsed_days = pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+    df["_day"] = parsed_days
     df["_stars"] = df["stats:stars"].apply(_safe)
+    df = df[df["_day"].notna()]
 
-    df["_day"] = df["stats:week"].apply(
-        lambda x: str(x)[:10] if len(str(x)) >= 10 else "?"
-    )
+    if df.empty:
+        return pd.DataFrame(columns=["day"])
 
     df["_language"] = df["repo:language"].apply(
         lambda v: str(v).strip() if str(v).strip() else "Unknown"
@@ -319,7 +335,7 @@ def historical_df() -> pd.DataFrame:
     return result
 
 
-def trending_weekly_df(limit: int = 10) -> pd.DataFrame:
+def trending_daily_df(limit: int = 10) -> pd.DataFrame:
     df = get_weekly_metrics(limit=2000)
     required_cols = {"stats:stars", "stats:forks"}
     if df.empty or not required_cols.issubset(set(df.columns)):
@@ -545,14 +561,14 @@ def render_header():
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
                 <div>
                     <div class="site-title">GitHub Trends Analyzer</div>
-                    <div class="site-subtitle">Real-time streaming + weekly batch pipeline dashboard</div>
+                    <div class="site-subtitle">Real-time streaming + daily batch pipeline dashboard</div>
                 </div>
                 <div style="display:flex;align-items:center;gap:1.5rem;">
                     <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
                         Stream: <span class="status-dot status-dot-live"></span> LIVE
                     </span>
                     <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
-                        Batch: <span class="status-dot status-dot-batch"></span> Last run weekly
+                        Batch: <span class="status-dot status-dot-batch"></span> Last run daily
                     </span>
                 </div>
             </div>
@@ -646,8 +662,8 @@ def render_rising_languages(df: pd.DataFrame):
                 <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
                 <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
             </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No weekly data yet — run the batch job first.</div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No daily batch data yet — run the batch job first.</div>
         </div>"""
         st.html(panel_html)
         return
@@ -660,8 +676,8 @@ def render_rising_languages(df: pd.DataFrame):
                 <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
                 <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
             </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Language enrichment is still in progress. Weekly stars are available, but language labels are not resolved yet.</div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Language enrichment is still in progress. Daily stars are available, but language labels are not resolved yet.</div>
         </div>"""
         st.html(panel_html)
         return
@@ -674,7 +690,7 @@ def render_rising_languages(df: pd.DataFrame):
             <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
             <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day (vs previous day)</div>
     </div>"""
     st.html(panel_html)
     st.bar_chart(chart_df, use_container_width=True)
@@ -717,22 +733,22 @@ def render_historical_trends(df: pd.DataFrame):
             <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
             <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — grouped by day from the latest batch</div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — grouped by day from daily batches</div>
     </div>"""
     st.html(panel_html)
     st.line_chart(chart_df, use_container_width=True)
 
 
-def render_trending_weekly(df: pd.DataFrame):
+def render_trending_daily(df: pd.DataFrame):
     if df.empty:
         panel_html = """
         <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending This Week</h3>
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Yesterday</h3>
                 <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
             </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks this week</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No weekly data yet — run the batch job first.</div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks for latest daily batch</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No daily batch data yet — run the batch job first.</div>
         </div>"""
         st.html(panel_html)
         return
@@ -760,10 +776,10 @@ def render_trending_weekly(df: pd.DataFrame):
     panel_html = f"""
     <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending This Week</h3>
+            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Yesterday</h3>
             <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks this week</div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks for latest daily batch</div>
         <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;display:flex;flex-direction:column;gap:4px;">
             {rows_html}
         </div>
@@ -851,8 +867,8 @@ def main():
     col5, col6 = st.columns(2)
 
     with col5:
-        weekly = trending_weekly_df(limit=10)
-        render_trending_weekly(weekly)
+        daily = trending_daily_df(limit=10)
+        render_trending_daily(daily)
 
     with col6:
         insights = ai_insights_df(limit=5)

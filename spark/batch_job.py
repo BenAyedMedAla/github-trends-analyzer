@@ -2,31 +2,33 @@
 opentrend — batch_job.py
 --------------------------
 Reads GH Archive .json.gz files from HDFS, computes weekly
-metrics per repo, and writes results to HBase.
+metrics per repo for each day, and writes results to HBase.
 
-Run manually or triggered by Airflow DAG weekly.
+Run manually or triggered by the daily Airflow DAG.
 
 Pipeline:
   HDFS /user/root/gharchive/*.json.gz
     → PySpark (read + aggregate)
-      → HBase: weekly_metrics  (star velocity per repo)
+    → HBase: weekly_metrics  (daily star velocity per repo)
 
 Enhancements over v1:
   - foreachPartition for HBase writes (no driver OOM)
   - DataFrame cached to avoid double Spark DAG evaluation
   - Parallel REST fallback with ThreadPoolExecutor (10 workers)
-  - Dedicated batch_metadata table replaces full weekly_metrics scan
-  - stats:week stored as clean YYYY-MM-DD (no Streamlit [:10] hack)
+    - Dedicated batch_metadata table replaces full weekly_metrics scan
+    - stats:day stored as clean YYYY-MM-DD (stats:week kept for compatibility)
   - stats:repo_count written for correct "Rising Languages" panel
-  - stats:fork_velocity written for correct "Trending This Week" score
+    - stats:fork_velocity written for correct trending score panel
   - HBase repos table queried for ALL repos before GraphQL (not just top 200)
   - GraphQL enrichment limited to repos still missing after HBase lookup
 """
 
 import os
 import sys
+import time
 import happybase
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 from dotenv import load_dotenv
@@ -49,13 +51,10 @@ HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
 GHARCHIVE_HDFS_PATH = os.getenv("GHARCHIVE_HDFS_PATH", "/user/root/gharchive")
-DEBUG_DAY   = os.getenv("DEBUG_DAY", "")  # e.g. "2026-04-13"
-
-if DEBUG_DAY:
-    HDFS_INPUT = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/{DEBUG_DAY}.json.gz"
-    print(f"DEBUG: Processing single day {DEBUG_DAY}")
-else:
-    HDFS_INPUT = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/*.json.gz"
+BATCH_DAY = os.getenv("BATCH_DAY", "").strip()  # e.g. "2026-04-13"
+DEBUG_DAY = os.getenv("DEBUG_DAY", "").strip()  # legacy override
+TARGET_DAY = BATCH_DAY or DEBUG_DAY or (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+HDFS_INPUT = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/{TARGET_DAY}*.json.gz"
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -106,15 +105,15 @@ def build_repo_key(repo_name) -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────
-# Processed-week tracking  (replaces full weekly_metrics scan)
+# Processed-day tracking  (replaces full weekly_metrics scan)
 # ─────────────────────────────────────────────────────────────
 # We use a single HBase table  batch_metadata  with row key
-#   "processed_weeks"  and one qualifier per week:
-#   meta:YYYY-MM-DD  →  "1"
+#   "processed_days"  and one qualifier per day:
+#   meta:YYYY-MM-DD  ->  "1"
 # This makes get/set O(1) instead of O(all rows in weekly_metrics).
 
 METADATA_TABLE   = "batch_metadata"
-METADATA_ROW_KEY = b"processed_weeks"
+METADATA_ROW_KEY = b"processed_days"
 METADATA_CF      = b"meta"
 
 
@@ -129,9 +128,9 @@ def ensure_metadata_table(connection: happybase.Connection) -> None:
         log.info("Created HBase table: %s", METADATA_TABLE)
 
 
-def get_processed_weeks(connection: happybase.Connection) -> set:
+def get_processed_days(connection: happybase.Connection) -> set:
     """
-    Return the set of already-processed week strings (YYYY-MM-DD).
+    Return the set of already-processed day strings (YYYY-MM-DD).
     O(1) HBase get instead of a full weekly_metrics scan.
     """
     ensure_metadata_table(connection)
@@ -141,23 +140,23 @@ def get_processed_weeks(connection: happybase.Connection) -> set:
         k.decode("utf-8").replace(f"{METADATA_CF.decode()}:", "")
         for k in row.keys()
     }
-    log.info("Already processed weeks: %s", processed)
+    log.info("Already processed days: %s", processed)
     return processed
 
 
-def mark_weeks_processed(
+def mark_days_processed(
     connection: happybase.Connection,
-    weeks: list,
+    days: list,
 ) -> None:
-    """Record newly processed weeks in batch_metadata."""
-    if not weeks:
+    """Record newly processed days in batch_metadata."""
+    if not days:
         return
     table = connection.table(METADATA_TABLE)
     table.put(
         METADATA_ROW_KEY,
-        {f"{METADATA_CF.decode()}:{w}".encode(): b"1" for w in weeks},
+        {f"{METADATA_CF.decode()}:{d}".encode(): b"1" for d in days},
     )
-    log.info("Marked weeks as processed: %s", weeks)
+    log.info("Marked days as processed: %s", days)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -165,17 +164,17 @@ def mark_weeks_processed(
 # ─────────────────────────────────────────────────────────────
 
 
-def _compute_velocity(df_weekly):
+def _compute_velocity(df_daily):
     """
     Clean velocity computation using explicit imports.
     Replaces compute_actual_velocity above.
     """
     from pyspark.sql.functions import lag as spark_lag
 
-    window_spec = Window.partitionBy("repo_name").orderBy("week")
+    window_spec = Window.partitionBy("repo_name").orderBy("day")
 
     return (
-        df_weekly
+        df_daily
         .withColumn("prev_stars",  spark_lag("star_count",  1).over(window_spec))
         .withColumn("prev_forks",  spark_lag("fork_count",  1).over(window_spec))
         .withColumn("velocity",    coalesce(col("star_count")  - col("prev_stars"),  col("star_count")))
@@ -280,10 +279,27 @@ def batch_enrich_repos(repo_names: list) -> dict:
         len(repos_needing_api),
     )
 
+    token = (os.getenv("GITHUB_TOKEN", "") or "").strip()
     headers = {
-        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN', '')}",
         "Accept": "application/vnd.github+json",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        log.warning("GITHUB_TOKEN is not set; GitHub API calls will be rate-limited")
+
+    def _has_graphql_rate_limit_or_auth_error(payload: dict) -> bool:
+        errors = payload.get("errors") or []
+        for err in errors:
+            msg = str(err.get("message", "")).lower()
+            if (
+                "rate limit" in msg
+                or "api rate limit exceeded" in msg
+                or "bad credentials" in msg
+                or "requires authentication" in msg
+            ):
+                return True
+        return False
 
     # ── Step 2: GraphQL batch (50 per request) ────────────────
     unresolved_after_graphql: list = []
@@ -322,6 +338,15 @@ def batch_enrich_repos(repo_names: list) -> dict:
             if resp.status_code != 200:
                 log.warning("GraphQL HTTP %d — queuing batch for REST fallback", resp.status_code)
                 unresolved_after_graphql.extend(batch)
+                if resp.status_code in (401, 403, 429):
+                    remaining = repos_needing_api[i + batch_size :]
+                    unresolved_after_graphql.extend(remaining)
+                    log.warning(
+                        "GraphQL unavailable (HTTP %d). Switching remaining %d repos to REST fallback.",
+                        resp.status_code,
+                        len(remaining),
+                    )
+                    break
                 continue
 
             payload = resp.json()
@@ -329,6 +354,24 @@ def batch_enrich_repos(repo_names: list) -> dict:
             errors  = payload.get("errors") or []
             if errors:
                 log.warning("GraphQL returned %d errors in batch", len(errors))
+                unresolved_after_graphql.extend(batch)
+                remaining = repos_needing_api[i + batch_size :]
+                unresolved_after_graphql.extend(remaining)
+                log.warning(
+                    "GraphQL error detected. Switching remaining %d repos to REST fallback.",
+                    len(remaining),
+                )
+                break
+
+            if _has_graphql_rate_limit_or_auth_error(payload):
+                unresolved_after_graphql.extend(batch)
+                remaining = repos_needing_api[i + batch_size :]
+                unresolved_after_graphql.extend(remaining)
+                log.warning(
+                    "GraphQL rate/auth error detected. Switching remaining %d repos to REST fallback.",
+                    len(remaining),
+                )
+                break
 
             resolved_in_batch: set = set()
             for alias, repo in alias_to_repo.items():
@@ -353,12 +396,16 @@ def batch_enrich_repos(repo_names: list) -> dict:
 
     # ── Step 3: Parallel REST fallback ───────────────────────
     still_missing = [
-        r for r in unresolved_after_graphql
+        r for r in dict.fromkeys(unresolved_after_graphql)
         if enrichment_map.get(r, {}).get("language") in ("Unknown", "", None)
     ]
 
     if still_missing:
         log.info("REST fallback for %d repos (ThreadPoolExecutor, 10 workers)", len(still_missing))
+        rest_total = len(still_missing)
+        rest_done = 0
+        rest_started_at = time.monotonic()
+        progress_every = 1000
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_repo = {
                 executor.submit(_fetch_repo_rest, repo, headers): repo
@@ -370,6 +417,22 @@ def batch_enrich_repos(repo_names: list) -> dict:
                     enrichment_map[repo] = future.result()
                 except Exception as exc:
                     log.warning("REST fetch failed for %s: %s", repo, exc)
+                finally:
+                    rest_done += 1
+                    if rest_done % progress_every == 0 or rest_done == rest_total:
+                        elapsed = max(time.monotonic() - rest_started_at, 0.001)
+                        rate = rest_done / elapsed
+                        remaining = rest_total - rest_done
+                        eta_seconds = (remaining / rate) if rate > 0 else 0
+                        log.info(
+                            "REST fallback progress: %d/%d completed (%.2f%%), elapsed=%.1fs, rate=%.1f repos/s, eta=%.1f min",
+                            rest_done,
+                            rest_total,
+                            (rest_done / rest_total) * 100,
+                            elapsed,
+                            rate,
+                            eta_seconds / 60,
+                        )
 
     log.info("Repo enrichment complete for %d repos", len(repo_names))
     return enrichment_map
@@ -384,7 +447,7 @@ def _write_partition_to_hbase(
     hbase_host: str,
     hbase_port: int,
     enrichment_broadcast: dict,
-    max_week: str,
+    max_day: str,
 ) -> None:
     """
     Executed on each Spark executor partition.
@@ -396,7 +459,7 @@ def _write_partition_to_hbase(
     with table.batch() as batch:
         for row in rows:
             repo_name    = row["repo_name"]  or "unknown"
-            week         = row["week"]       or "unknown"
+            day          = row["day"]        or "unknown"
             star_count   = str(row["star_count"]    or 0)
             fork_count   = str(row["fork_count"]    or 0)
             velocity     = str(row["velocity"]      or 0)
@@ -408,7 +471,7 @@ def _write_partition_to_hbase(
             api_stars    = str(enrichment.get("stargazers_count", 0))
             api_forks    = str(enrichment.get("forks_count", 0))
 
-            row_key = f"{week}#{repo_name}".encode("utf-8")
+            row_key = f"{day}#{repo_name}".encode("utf-8")
 
             batch.put(row_key, {
                 b"repo:name":          repo_name.encode(),
@@ -421,57 +484,58 @@ def _write_partition_to_hbase(
                 b"stats:repo_count":   repo_count.encode(),
                 b"stats:api_stars":    api_stars.encode(),
                 b"stats:api_forks":    api_forks.encode(),
-                b"stats:week":         week.encode(),
+                b"stats:day":          day.encode(),
+                b"stats:week":         day.encode(),
             })
 
-            # Last-week snapshot (only for the latest week in this run)
-            if week == max_week:
+            # Last-day snapshot (only for the latest day in this run)
+            if day == max_day:
                 batch.put(
-                    f"last_week_data_{repo_name}".encode(),
+                    f"last_day_data_{repo_name}".encode(),
                     {
                         b"stats:last_stars":        star_count.encode(),
                         b"stats:last_forks":        fork_count.encode(),
                         b"stats:last_api_stars":    api_stars.encode(),
                         b"stats:last_api_forks":    api_forks.encode(),
-                        b"stats:last_week":         week.encode(),
+                        b"stats:last_day":          day.encode(),
                     },
                 )
 
     conn.close()
 
 
-def write_weekly_metrics_bulk(
-    df_weekly,
+def write_daily_metrics_bulk(
+    df_daily,
     enrichment_map: dict,
     hbase_host: str,
     hbase_port: int,
 ) -> None:
     """
-    Write weekly metrics to HBase using foreachPartition.
+    Write daily metrics to HBase using foreachPartition.
     Spark executors open their own connections — no driver collect().
     enrichment_map is broadcast via a Python closure (small dict, safe).
     """
-    # Determine the max week so executors know which rows get the snapshot.
-    max_week_row = (
-        df_weekly.select("week")
-        .orderBy(desc("week"))
+    # Determine the max day so executors know which rows get the snapshot.
+    max_day_row = (
+        df_daily.select("day")
+        .orderBy(desc("day"))
         .limit(1)
         .collect()
     )
-    max_week = max_week_row[0]["week"] if max_week_row else ""
-    log.info("Max week in this run: %s", max_week)
+    max_day = max_day_row[0]["day"] if max_day_row else ""
+    log.info("Max day in this run: %s", max_day)
 
     # Capture in closure (broadcast-like for small dicts)
     _enrichment   = enrichment_map
     _host         = hbase_host
     _port         = hbase_port
-    _max_week     = max_week
+    _max_day      = max_day
 
     def write_partition(rows):
-        _write_partition_to_hbase(rows, _host, _port, _enrichment, _max_week)
+        _write_partition_to_hbase(rows, _host, _port, _enrichment, _max_day)
 
-    log.info("Writing weekly_metrics via foreachPartition...")
-    df_weekly.foreachPartition(write_partition)
+    log.info("Writing daily metrics to weekly_metrics via foreachPartition...")
+    df_daily.foreachPartition(write_partition)
     log.info("weekly_metrics write complete")
 
 
@@ -569,6 +633,7 @@ def backfill_unknown_languages(limit_rows: int = 10_000) -> None:
 
 def main():
     log.info("opentrend Spark Batch job starting...")
+    log.info("  Target day : %s", TARGET_DAY)
     log.info("  Input path : %s", HDFS_INPUT)
     log.info("  HBase      : %s:%d", HBASE_HOST, HBASE_PORT)
 
@@ -582,9 +647,9 @@ def main():
     spark.conf.set("spark.sql.files.ignoreCorruptFiles", "true")
     log.info("Spark session created")
 
-    # ── Processed weeks (fast O(1) HBase get) ─────────────────
+    # ── Processed days (fast O(1) HBase get) ──────────────────
     connection = get_hbase_connection()
-    processed_weeks = get_processed_weeks(connection)
+    processed_days = get_processed_days(connection)
     connection.close()
 
     # ── Read GH Archive from HDFS ─────────────────────────────
@@ -605,58 +670,58 @@ def main():
     # ── Filter: WatchEvent + ForkEvent only ───────────────────
     relevant = raw.filter(col("type").isin(["WatchEvent", "ForkEvent"]))
 
-    # ── Extract clean YYYY-MM-DD week column ──────────────────
+    # ── Extract clean YYYY-MM-DD day column ───────────────────
     events = relevant.select(
         col("type").alias("event_type"),
         col("repo.name").alias("repo_name"),
         col("created_at"),
-        date_trunc("week", to_timestamp(col("created_at")))
+        date_trunc("day", to_timestamp(col("created_at")))
             .cast("date")
             .cast("string")
-            .alias("week"),
+            .alias("day"),
     )
 
-    # ── Weekly aggregation ────────────────────────────────────
-    weekly = (
+    # ── Daily aggregation ─────────────────────────────────────
+    daily = (
         events
-        .groupBy("week", "repo_name")
+        .groupBy("day", "repo_name")
         .agg(
             count(when(col("event_type") == "WatchEvent", 1)).alias("star_count"),
             count(when(col("event_type") == "ForkEvent",  1)).alias("fork_count"),
             countDistinct("repo_name").alias("repo_count"),   # for Rising Languages
             count("*").alias("total_events"),
         )
-        .filter(col("repo_name").isNotNull() & col("week").isNotNull())
+        .filter(col("repo_name").isNotNull() & col("day").isNotNull())
     )
 
-    # ── Skip already-processed weeks ─────────────────────────
-    if processed_weeks:
-        weekly = weekly.filter(~col("week").isin(*processed_weeks))
+    # ── Skip already-processed days ───────────────────────────
+    if processed_days:
+        daily = daily.filter(~col("day").isin(*processed_days))
 
     # ── CACHE before any action to avoid double evaluation ────
-    weekly.cache()
-    new_row_count = weekly.count()  # single Spark action
+    daily.cache()
+    new_row_count = daily.count()  # single Spark action
 
     if new_row_count == 0:
-        log.info("No new weeks found — running language backfill only.")
+        log.info("No new days found — running language backfill only.")
         backfill_unknown_languages(limit_rows=10_000)
-        weekly.unpersist()
+        daily.unpersist()
         spark.stop()
         return
 
     log.info("New rows to process: %d", new_row_count)
 
     # ── Velocity (window over cached DF) ─────────────────────
-    weekly_with_velocity = _compute_velocity(weekly)
+    daily_with_velocity = _compute_velocity(daily)
 
     # Sort for readability in logs
-    weekly_with_velocity = weekly_with_velocity.orderBy(desc("velocity"))
-    weekly_with_velocity.show(10, truncate=False)
+    daily_with_velocity = daily_with_velocity.orderBy(desc("velocity"))
+    daily_with_velocity.show(10, truncate=False)
 
     # ── Collect repo names for enrichment ────────────────────
     # Collect ALL unique repos in this run (not just top 200).
     repo_names: list = []
-    for row in weekly_with_velocity.select("repo_name").distinct().collect():
+    for row in daily_with_velocity.select("repo_name").distinct().collect():
         repo = row["repo_name"]
         if repo is None:
             continue
@@ -671,23 +736,23 @@ def main():
     enrichment_map = batch_enrich_repos(repo_names)
 
     # ── Write to HBase via foreachPartition ───────────────────
-    write_weekly_metrics_bulk(
-        weekly_with_velocity,
+    write_daily_metrics_bulk(
+        daily_with_velocity,
         enrichment_map,
         hbase_host=HBASE_HOST,
         hbase_port=HBASE_PORT,
     )
 
-    # ── Mark weeks as processed ───────────────────────────────
-    new_weeks = [
-        row["week"]
-        for row in weekly_with_velocity.select("week").distinct().collect()
+    # ── Mark days as processed ────────────────────────────────
+    new_days = [
+        row["day"]
+        for row in daily_with_velocity.select("day").distinct().collect()
     ]
     connection = get_hbase_connection()
-    mark_weeks_processed(connection, new_weeks)
+    mark_days_processed(connection, new_days)
     connection.close()
 
-    weekly.unpersist()
+    daily.unpersist()
     log.info("Batch job complete")
     spark.stop()
 
