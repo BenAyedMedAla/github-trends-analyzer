@@ -15,7 +15,6 @@ Pipeline (TP1 MapReduce logic, rewritten in PySpark TP2 style):
 
 import os
 import sys
-import glob
 import happybase
 import logging
 from pathlib import Path
@@ -37,8 +36,6 @@ load_dotenv(BASE_DIR / ".env")
 HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
-LOCAL_INPUT_DIR = os.getenv("LOCAL_GHARCHIVE_DIR", "/data/gharchive")
-LOCAL_INPUT = f"{LOCAL_INPUT_DIR}/*.json.gz"
 HDFS_INPUT  = f"hdfs://{HDFS_HOST}/user/root/gharchive/*.json.gz"
 
 # ── Logging ───────────────────────────────────────────────────
@@ -50,16 +47,8 @@ log = logging.getLogger("batch_job")
 
 
 def resolve_input_path() -> str:
-    """
-    Prefer mounted local GH Archive files when available.
-    Fallback to HDFS path for cluster-managed datasets.
-    """
-    local_files = glob.glob(LOCAL_INPUT)
-    if local_files:
-        log.info(f"Found {len(local_files)} local GH Archive file(s) in {LOCAL_INPUT_DIR}")
-        return LOCAL_INPUT
-
-    log.warning("No local GH Archive files found, falling back to HDFS input")
+    """Use HDFS as the single source of truth for GH Archive data."""
+    log.info("Using HDFS input only for batch processing")
     return HDFS_INPUT
 
 
@@ -225,7 +214,6 @@ def main():
         raw = spark.read.option("badRecordsPath", "/tmp/bad_records").json(input_path)
     except Exception as e:
         log.error(f"Failed to read GH Archive input: {e}")
-        log.error(f"Checked local path: {LOCAL_INPUT}")
         log.error(f"Checked HDFS path:  {HDFS_INPUT}")
         log.warning("Attempting to read valid files only...")
         # Try reading with permissive mode to skip corrupted files

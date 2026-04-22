@@ -22,7 +22,7 @@ Built as a university big data project. Combines a live GitHub event stream with
 | Batch processing | PySpark reading GH Archive `.json.gz` files |
 | Storage | HBASE |
 |  Dashboard | Streamlit |
-| Orchestration | Docker Compose |
+| Orchestration | Apache Airflow + Docker Compose |
  
  
 ## Getting started
@@ -50,11 +50,15 @@ GITHUB_TOKEN=ghp_yourtoken
  
 A GitHub personal access token is free — generate one at github.com/settings/tokens with no scopes required. It raises your API limit from 60 to 5,000 requests/hour.
  
-### 3. Download some batch data (optional, for batch panels)
- 
+### 3. Load batch data into HDFS (optional fallback)
+
 ```bash
-# example: download one week of data
-wget https://data.gharchive.org/2024-01-15-{0..23}.json.gz -P data/gharchive/
+# inside hadoop-master container (example: one full day, hourly files)
+hdfs dfs -mkdir -p /user/root/gharchive
+for h in {0..23}; do
+	wget https://data.gharchive.org/2024-01-15-$h.json.gz
+done
+hdfs dfs -put -f 2024-01-15-*.json.gz /user/root/gharchive/
 ```
  
 ### 4. Start everything
@@ -63,9 +67,18 @@ wget https://data.gharchive.org/2024-01-15-{0..23}.json.gz -P data/gharchive/
 docker compose up --build
 ```
 
-### 5. Run the weekly batch manually (using local `.json.gz` files)
+Start Airflow (scheduler + web UI):
 
-If you downloaded GH Archive files into `data/gharchive/`, run:
+```bash
+docker compose --profile airflow up -d airflow
+```
+
+Airflow UI: http://localhost:8080
+Default credentials: `admin` / `admin`
+
+### 5. Run the weekly batch manually (HDFS input only)
+
+After GH Archive files are present under `hdfs:///user/root/gharchive/`, run:
 
 ```bash
 docker compose --profile batch run --rm spark-batch
@@ -75,15 +88,27 @@ The batch job writes into HBase tables used by Streamlit:
 - `weekly_metrics`
 - `ml_predictions`
 
-### 6. One-click batch from Streamlit
+### 6. Airflow orchestration (recommended)
 
-In the Streamlit sidebar, click **Run Weekly Batch**.
+An example DAG is provided at `airflow/dags/hdfs_weekly_batch.py`.
 
-What it does automatically:
-- downloads the last 7 full days of GH Archive files into `data/gharchive/`
-- triggers Spark batch processing
-- writes fresh data to `weekly_metrics` and `ml_predictions`
-- shows execution logs in the app
+It:
+- checks runtime dependency (`docker`)
+- downloads the last 7 full days of GH Archive data
+- uploads downloaded files into `/user/root/gharchive` in HDFS
+- verifies HDFS input exists at `/user/root/gharchive`
+- triggers `spark-submit` in `opentrend-spark`
+- runs weekly on Monday at 02:00
+
+Use Airflow as the single scheduler and remove duplicate schedulers.
+
+To run it once manually from Airflow UI:
+- open DAG `hdfs_weekly_batch`
+- click `Trigger DAG`
+
+This trigger now performs full automation:
+- ingestion (GH Archive -> HDFS)
+- weekly Spark batch execution
  
 | Service | URL |
 |---|---|
