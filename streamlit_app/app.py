@@ -334,7 +334,7 @@ def language_stats_df() -> pd.DataFrame:
 def historical_df() -> pd.DataFrame:
     df = get_weekly_metrics(limit=5000)
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["day", "Python", "TypeScript", "Rust", "Go", "Java"])
 
     def _safe(v):
         try:
@@ -345,22 +345,26 @@ def historical_df() -> pd.DataFrame:
     df["_week"] = df["stats:week"].apply(_safe)
     df["_stars"] = df["stats:stars"].apply(_safe)
 
-    df["_month"] = df["stats:week"].apply(
-        lambda x: datetime.strptime(str(x)[:10], "%Y-%m-%d").strftime("%b")
-        if len(str(x)) >= 10 else "?"
+    df["_day"] = df["stats:week"].apply(
+        lambda x: str(x)[:10] if len(str(x)) >= 10 else "?"
     )
 
+    languages = ["Python", "TypeScript", "Rust", "Go", "Java"]
     records = []
-    for month, grp in df.groupby("_month"):
+    for day, grp in df.groupby("_day"):
         lang_totals = grp.groupby("repo:language")["_stars"].sum()
-        record = {"month": month}
-        for lang, total in lang_totals.items():
-            record[lang] = int(total)
+        record = {"day": day}
+        for lang in languages:
+            record[lang] = int(lang_totals.get(lang, 0))
         records.append(record)
 
     result = pd.DataFrame(records)
     if not result.empty:
-        result = result.sort_values("month").reset_index(drop=True)
+        result = result.sort_values("day").reset_index(drop=True)
+        for lang in languages:
+            if lang not in result.columns:
+                result[lang] = 0
+        result = result[["day", *languages]]
     return result
 
 
@@ -697,8 +701,8 @@ def render_rising_languages(df: pd.DataFrame):
         st.html(panel_html)
         return
 
-    chart_df = df.head(8).copy().set_index("language")
-    series_max = max(int(df["thisWeek"].max()), 1)
+    chart_df = df.head(8).copy().set_index("language")[["thisWeek", "lastWeek"]]
+
     panel_html = f"""
     <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
@@ -706,20 +710,9 @@ def render_rising_languages(df: pd.DataFrame):
             <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
         </div>
         <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
-        <div style="display:flex;flex-direction:column;gap:6px;">
-            {''.join(
-                f'<div style="display:flex;align-items:center;gap:8px;">'
-                f'<span style="width:80px;font-size:0.75rem;color:#e6edf3;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{lang}</span>'
-                f'<div style="flex:1;height:18px;background:rgba(137,87,229,0.15);border-radius:4px;overflow:hidden;">'
-                f'<div style="width:{max(int(row["thisWeek"])/series_max*100,2):.1f}%;height:100%;background:linear-gradient(90deg,#8957e5,#bc8cff);border-radius:4px;"></div>'
-                f'</div>'
-                f'<span style="width:60px;text-align:right;font-family:monospace;font-size:0.75rem;color:#8957e5;flex-shrink:0;">{int(row["thisWeek"]):,}</span>'
-                f'</div>'
-                for lang, row in chart_df.iterrows()
-            )}
-        </div>
     </div>"""
     st.html(panel_html)
+    st.bar_chart(chart_df, use_container_width=True)
 
 
 def render_historical_trends(df: pd.DataFrame):
@@ -737,30 +730,7 @@ def render_historical_trends(df: pd.DataFrame):
         return
 
     languages = ["Python", "TypeScript", "Rust", "Go", "Java"]
-    lang_colors = {
-        "Python": "#f0c040",
-        "TypeScript": "#79c0ff",
-        "Rust": "#f97316",
-        "Go": "#38bdf8",
-        "Java": "#f87171",
-    }
-
-    all_langs = set(df.columns) - {"month"}
-    chart_rows = ""
-    for _, row in df.iterrows():
-        month = row.get("month", "?")
-        chart_rows += f'<div style="display:grid;grid-template-columns:40px repeat({len(all_langs)} 1fr);gap:2px;align-items:center;padding:4px 0;border-bottom:1px solid #21262d;font-size:0.72rem;">'
-        chart_rows += f'<div style="color:#7d8590;font-family:monospace;">{month}</div>'
-        for lang in all_langs:
-            val = int(row.get(lang, 0) or 0)
-            color = lang_colors.get(lang, "#8957e5")
-            pct = max(val / max(df[lang].max(), 1) * 100, 2)
-            chart_rows += (
-                f'<div style="display:flex;align-items:center;gap:4px;">'
-                f'<div style="width:{pct:.1f}%;height:14px;background:{color};border-radius:2px;opacity:0.8;"></div>'
-                f'</div>'
-            )
-        chart_rows += "</div>"
+    chart_df = df.copy().set_index("day")[languages]
 
     panel_html = f"""
     <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
@@ -768,17 +738,10 @@ def render_historical_trends(df: pd.DataFrame):
             <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
             <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
-        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-            {''.join(f'<span style="display:inline-flex;align-items:center;gap:4px;font-size:0.65rem;color:{lang_colors.get(l,"#7d8590")};">'
-                     f'<span style="width:8px;height:8px;border-radius:2px;background:{lang_colors.get(l,"#8957e5")};"></span>'
-                     f'{l}</span>' for l in all_langs)}
-        </div>
-        <div style="overflow-x:auto;max-height:260px;overflow-y:auto;">
-            {chart_rows}
-        </div>
+        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — grouped by day from the latest batch</div>
     </div>"""
     st.html(panel_html)
+    st.line_chart(chart_df, use_container_width=True)
 
 
 def render_trending_weekly(df: pd.DataFrame):
