@@ -333,8 +333,7 @@ def trending_weekly_df(limit: int = 10) -> pd.DataFrame:
 
     df["_stars"] = df["stats:stars"].apply(_safe)
     df["_forks"] = df["stats:forks"].apply(_safe)
-    df["_score"] = df["_stars"] + df["_forks"]
-
+    df["_score"] = df["stats:velocity"].apply(_safe) + df["stats:fork_velocity"].apply(_safe) 
     top = df.nlargest(limit, "_score")
     records = []
     for _, row in top.iterrows():
