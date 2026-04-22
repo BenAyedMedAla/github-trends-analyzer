@@ -62,6 +62,28 @@ wget https://data.gharchive.org/2024-01-15-{0..23}.json.gz -P data/gharchive/
 ```bash
 docker compose up --build
 ```
+
+### 5. Run the weekly batch manually (using local `.json.gz` files)
+
+If you downloaded GH Archive files into `data/gharchive/`, run:
+
+```bash
+docker compose --profile batch run --rm spark-batch
+```
+
+The batch job writes into HBase tables used by Streamlit:
+- `weekly_metrics`
+- `ml_predictions`
+
+### 6. One-click batch from Streamlit
+
+In the Streamlit sidebar, click **Run Weekly Batch**.
+
+What it does automatically:
+- downloads the last 7 full days of GH Archive files into `data/gharchive/`
+- triggers Spark batch processing
+- writes fresh data to `weekly_metrics` and `ml_predictions`
+- shows execution logs in the app
  
 | Service | URL |
 |---|---|

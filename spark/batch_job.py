@@ -15,6 +15,7 @@ Pipeline (TP1 MapReduce logic, rewritten in PySpark TP2 style):
 
 import os
 import sys
+import glob
 import happybase
 import logging
 from pathlib import Path
@@ -36,6 +37,8 @@ load_dotenv(BASE_DIR / ".env")
 HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
+LOCAL_INPUT_DIR = os.getenv("LOCAL_GHARCHIVE_DIR", "/data/gharchive")
+LOCAL_INPUT = f"{LOCAL_INPUT_DIR}/*.json.gz"
 HDFS_INPUT  = f"hdfs://{HDFS_HOST}/user/root/gharchive/*.json.gz"
 
 # ── Logging ───────────────────────────────────────────────────
@@ -44,6 +47,20 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s"
 )
 log = logging.getLogger("batch_job")
+
+
+def resolve_input_path() -> str:
+    """
+    Prefer mounted local GH Archive files when available.
+    Fallback to HDFS path for cluster-managed datasets.
+    """
+    local_files = glob.glob(LOCAL_INPUT)
+    if local_files:
+        log.info(f"Found {len(local_files)} local GH Archive file(s) in {LOCAL_INPUT_DIR}")
+        return LOCAL_INPUT
+
+    log.warning("No local GH Archive files found, falling back to HDFS input")
+    return HDFS_INPUT
 
 
 def get_hbase_connection():
@@ -185,8 +202,10 @@ def write_ml_predictions(df_predictions):
 
 
 def main():
+    input_path = resolve_input_path()
+
     log.info("opentrend Spark Batch job starting...")
-    log.info(f"  HDFS input : {HDFS_INPUT}")
+    log.info(f"  Input path : {input_path}")
     log.info(f"  HBase      : {HBASE_HOST}:{HBASE_PORT}")
 
     # ── Create Spark Session ───────────────────────────────────
@@ -201,14 +220,21 @@ def main():
     # ── Read GH Archive files from HDFS ───────────────────────
     # GH Archive files are JSON (one event per line) inside .gz
     # Spark reads them natively — same as TP1 HDFS file read
-    log.info("Reading GH Archive files from HDFS...")
+    log.info("Reading GH Archive files...")
     try:
-        raw = spark.read.json(HDFS_INPUT)
+        raw = spark.read.option("badRecordsPath", "/tmp/bad_records").json(input_path)
     except Exception as e:
-        log.error(f"Failed to read from HDFS: {e}")
-        log.error("Make sure you have uploaded .json.gz files:")
-        log.error("  hdfs dfs -put yourfile.json.gz /user/root/gharchive/")
-        sys.exit(1)
+        log.error(f"Failed to read GH Archive input: {e}")
+        log.error(f"Checked local path: {LOCAL_INPUT}")
+        log.error(f"Checked HDFS path:  {HDFS_INPUT}")
+        log.warning("Attempting to read valid files only...")
+        # Try reading with permissive mode to skip corrupted files
+        try:
+            raw = spark.read.option("badRecordsPath", "/tmp/bad_records").option("mode", "PERMISSIVE").json(input_path)
+            log.info(f"Recovered: read {raw.count()} valid events after skipping corrupted files")
+        except Exception as e2:
+            log.error(f"Unable to recover from read failure: {e2}")
+            sys.exit(1)
 
     log.info(f"Total events loaded: {raw.count()}")
 

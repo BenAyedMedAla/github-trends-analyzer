@@ -1,12 +1,19 @@
 import os
 import socket
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import happybase
 import pandas as pd
+import requests
 import streamlit as st
+
+try:
+    import docker
+except Exception:
+    docker = None
 
 st.set_page_config(page_title="GitHub Trends Analyzer", page_icon="data", layout="wide")
 
@@ -14,6 +21,119 @@ HBASE_HOST = os.getenv("HBASE_HOST", "hadoop-master")
 HBASE_PORT = int(os.getenv("HBASE_PORT", "9090"))
 DEFAULT_LIMIT = int(os.getenv("STREAMLIT_DEFAULT_LIMIT", "100"))
 REFRESH_INTERVAL = int(os.getenv("STREAMLIT_REFRESH_SECONDS", "5"))
+GHARCHIVE_DIR = os.getenv("GHARCHIVE_DATA_DIR", "/data/gharchive")
+SPARK_CONTAINER_NAME = os.getenv("SPARK_CONTAINER_NAME", "opentrend-spark")
+GHARCHIVE_BASE_URL = os.getenv("GHARCHIVE_BASE_URL", "https://data.gharchive.org")
+
+
+def _download_file(url: str, destination: Path) -> bool:
+    """Download one .gz file if available. Validates gzip integrity. Returns True when valid."""
+    try:
+        with requests.get(url, stream=True, timeout=30) as response:
+            if response.status_code != 200:
+                return False
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 64):
+                    if chunk:
+                        handle.write(chunk)
+        
+        # Validate gzip integrity
+        import gzip
+        try:
+            with gzip.open(destination, "rb") as f:
+                f.read(1)  # Try to read first byte
+            return True
+        except Exception:
+            destination.unlink(missing_ok=True)  # Delete corrupted file
+            return False
+    except Exception:
+        destination.unlink(missing_ok=True)
+        return False
+
+
+def download_last_week_files() -> Dict[str, object]:
+    """
+    Download the last 7 full days of GH Archive files.
+    Tries daily file first, then hourly files for that day if needed.
+    """
+    base_path = Path(GHARCHIVE_DIR)
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    downloaded: List[str] = []
+    skipped: List[str] = []
+    failed_days: List[str] = []
+
+    today = datetime.utcnow().date()
+    for offset in range(1, 8):
+        day = today - timedelta(days=offset)
+        day_str = day.strftime("%Y-%m-%d")
+
+        daily_name = f"{day_str}.json.gz"
+        daily_path = base_path / daily_name
+
+        if daily_path.exists():
+            skipped.append(daily_name)
+            continue
+
+        daily_url = f"{GHARCHIVE_BASE_URL}/{daily_name}"
+        if _download_file(daily_url, daily_path):
+            downloaded.append(daily_name)
+            continue
+
+        hourly_success = 0
+        for hour in range(24):
+            hourly_name = f"{day_str}-{hour}.json.gz"
+            hourly_path = base_path / hourly_name
+            if hourly_path.exists():
+                hourly_success += 1
+                skipped.append(hourly_name)
+                continue
+
+            hourly_url = f"{GHARCHIVE_BASE_URL}/{hourly_name}"
+            if _download_file(hourly_url, hourly_path):
+                hourly_success += 1
+                downloaded.append(hourly_name)
+
+        if hourly_success == 0:
+            failed_days.append(day_str)
+
+    return {
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "failed_days": failed_days,
+        "target_dir": str(base_path),
+    }
+
+
+def trigger_batch_in_spark_container() -> Tuple[int, str]:
+    """Run spark batch job inside the running spark container via Docker socket."""
+    if docker is None:
+        return 1, "Python docker package is not installed in Streamlit container"
+
+    try:
+        client = docker.DockerClient(base_url="unix://var/run/docker.sock")
+        container = client.containers.get(SPARK_CONTAINER_NAME)
+        result = container.exec_run(
+            ["spark-submit", "--master", "local[*]", "/app/batch_job.py"],
+            stdout=True,
+            stderr=True,
+        )
+        output = result.output.decode("utf-8", errors="ignore") if result.output else ""
+        return int(result.exit_code), output
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def run_weekly_batch_automation() -> Dict[str, object]:
+    download_result = download_last_week_files()
+    exit_code, batch_logs = trigger_batch_in_spark_container()
+    return {
+        "download_result": download_result,
+        "batch_exit_code": exit_code,
+        "batch_logs": batch_logs,
+        "completed_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
 
 
 def get_connection() -> happybase.Connection:
@@ -762,6 +882,30 @@ def main():
     with st.sidebar:
         st.caption(f"Connected to: {HBASE_HOST}:{HBASE_PORT}")
         st.caption("Tables: live_events, live_metrics, repos, weekly_metrics, ml_predictions")
+
+        if st.button("Run Weekly Batch", use_container_width=True):
+            with st.spinner("Downloading last-week files and running batch..."):
+                st.session_state["batch_run_result"] = run_weekly_batch_automation()
+
+        result = st.session_state.get("batch_run_result")
+        if result:
+            dl = result.get("download_result", {})
+            exit_code = int(result.get("batch_exit_code", 1))
+            completed_at = result.get("completed_at", "")
+
+            if exit_code == 0:
+                st.success(f"Batch completed at {completed_at}")
+            else:
+                st.error(f"Batch failed at {completed_at}")
+
+            st.caption(
+                f"Files: +{len(dl.get('downloaded', []))} downloaded, "
+                f"{len(dl.get('skipped', []))} already present, "
+                f"{len(dl.get('failed_days', []))} day(s) unavailable"
+            )
+
+            with st.expander("Batch execution logs", expanded=False):
+                st.text(result.get("batch_logs", ""))
 
     render_header()
 
