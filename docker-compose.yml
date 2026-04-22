@@ -94,43 +94,45 @@ services:
   # ── 3. BACKEND ────────────────────────────────────────────
   # FastAPI — reads HBase via happybase (Thrift on port 9090)
   # Exposes REST endpoints + WebSocket for the dashboard
-  backend:
-    build: ./backend
-    container_name: opentrend-backend
-    restart: unless-stopped
-    networks:
-      - hadoop
-    ports:
-      - "8000:8000"
-    environment:
-      - HBASE_HOST=hadoop-master
-      - HBASE_PORT=9090           # HBase Thrift port
-      - KAFKA_HOST=hadoop-master:9092
-    volumes:
-      - ./backend:/app
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+  # DISABLED: backend directory does not exist
+  # backend:
+  #   build: ./backend
+  #   container_name: opentrend-backend
+  #   restart: unless-stopped
+  #   networks:
+  #     - hadoop
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - HBASE_HOST=hadoop-master
+  #     - HBASE_PORT=9090           # HBase Thrift port
+  #     - KAFKA_HOST=hadoop-master:9092
+  #   volumes:
+  #     - ./backend:/app
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
 
   # ── 4. FRONTEND ───────────────────────────────────────────
   # React dashboard — calls backend on port 8000
-  frontend:
-    build: ./frontend
-    container_name: opentrend-frontend
-    restart: unless-stopped
-    networks:
-      - hadoop
-    ports:
-      - "3000:3000"
-    environment:
-      - REACT_APP_API_URL=http://localhost:8000
-      - REACT_APP_WS_URL=ws://localhost:8000/ws
-    volumes:
-      - ./frontend/src:/app/src   # live reload during development
-    depends_on:
-      - backend
+  # DISABLED: frontend directory does not exist
+  # frontend:
+  #   build: ./frontend
+  #   container_name: opentrend-frontend
+  #   restart: unless-stopped
+  #   networks:
+  #     - hadoop
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - REACT_APP_API_URL=http://localhost:8000
+  #     - REACT_APP_WS_URL=ws://localhost:8000/ws
+  #   volumes:
+  #     - ./frontend/src:/app/src   # live reload during development
+  #   depends_on:
+  #     - backend
 
   # ── 5. HBASE EXPLORER (STREAMLIT) ────────────────────────
   streamlit:

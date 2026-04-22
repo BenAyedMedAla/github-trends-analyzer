@@ -40,7 +40,8 @@ load_dotenv(BASE_DIR / ".env")
 HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
-HDFS_INPUT  = f"hdfs://{HDFS_HOST}/user/root/gharchive/*.json.gz"
+GHARCHIVE_HDFS_PATH = os.getenv("GHARCHIVE_HDFS_PATH", "/user/root/gharchive")
+HDFS_INPUT  = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/*.json.gz"
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -110,23 +111,27 @@ def build_repo_key(repo_name: str) -> bytes:
     """Build a deterministic, collision-safe repo key used across HBase tables."""
     return quote(repo_name, safe="").encode("utf-8")
 
-def batch_enrich_with_language(repo_names: list) -> dict:
+def batch_enrich_repos(repo_names: list) -> dict:
     """
-    Call GitHub API to get language for each repo using batch GraphQL query.
-    Limits to 50 repos per request to avoid rate limits.
+    Enrich repos with language, stargazers_count, and forks_count from GitHub API.
+    Uses batch GraphQL query, limits to 50 repos per request to avoid rate limits.
+    Returns dict with repo_name -> {language, stargazers_count, forks_count}
     """
     import requests
 
     if not repo_names:
         return {}
 
-    language_map = {repo: "Unknown" for repo in repo_names}
+    enrichment_map = {
+        repo: {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
+        for repo in repo_names
+    }
     headers = {
         "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
         "Accept": "application/vnd.github+json"
     }
 
-    log.info(f"Fetching language for {len(repo_names)} repos via GraphQL...")
+    log.info(f"Enriching {len(repo_names)} repos with language, stars, and forks via GraphQL...")
 
     # Process in batches of 50
     batch_size = 50
@@ -134,7 +139,10 @@ def batch_enrich_with_language(repo_names: list) -> dict:
         batch = repo_names[i:i + batch_size]
 
         # Build GraphQL query for this batch
-        queries = "\n".join([f'{repo.split("/")[1]}: repository(owner: "{repo.split("/")[0]}", name: "{repo.split("/")[1]}") {{ language {{ name }} }}' for repo in batch])
+        queries = "\n".join([
+            f'{repo.split("/")[1]}: repository(owner: "{repo.split("/")[0]}", name: "{repo.split("/")[1]}") {{ language {{ name }} stargazersCount forks(first: 0) {{ totalCount }} }}'
+            for repo in batch
+        ])
 
         query = f"""{{
  {queries}
@@ -153,17 +161,25 @@ def batch_enrich_with_language(repo_names: list) -> dict:
                 for repo in batch:
                     try:
                         key = repo.split("/")[1]
-                        lang_data = data.get(key, {})
-                        lang = lang_data.get("language", {})
-                        language_map[repo] = lang.get("name", "Unknown") if lang else "Unknown"
+                        repo_data = data.get(key, {})
+                        lang = repo_data.get("language", {})
+                        language = lang.get("name", "Unknown") if lang else "Unknown"
+                        stargazers = repo_data.get("stargazersCount", 0) or 0
+                        forks_obj = repo_data.get("forks", {})
+                        forks = forks_obj.get("totalCount", 0) or 0
+                        enrichment_map[repo] = {
+                            "language": language,
+                            "stargazers_count": stargazers,
+                            "forks_count": forks
+                        }
                     except Exception:
-                        language_map[repo] = "Unknown"
+                        enrichment_map[repo] = {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
             else:
                 log.warning(f"GraphQL request failed: {r.status_code}")
 
         except Exception as e:
-            log.warning(f"Error fetching languages: {e}")
-            # Fall back to individual requests
+            log.warning(f"Error enriching repos: {e}")
+            # Fall back to individual REST requests
             for repo in batch:
                 try:
                     r = requests.get(
@@ -172,20 +188,26 @@ def batch_enrich_with_language(repo_names: list) -> dict:
                         timeout=5
                     )
                     if r.status_code == 200:
-                        language_map[repo] = r.json().get("language") or "Unknown"
+                        repo_json = r.json()
+                        enrichment_map[repo] = {
+                            "language": repo_json.get("language") or "Unknown",
+                            "stargazers_count": repo_json.get("stargazers_count") or 0,
+                            "forks_count": repo_json.get("forks_count") or 0
+                        }
                 except Exception:
-                    language_map[repo] = "Unknown"
+                    enrichment_map[repo] = {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
 
-    log.info("Language enrichment complete")
-    return language_map
+    log.info("Repo enrichment complete")
+    return enrichment_map
 
-def write_weekly_metrics_bulk(df_weekly, language_map=None):
+def write_weekly_metrics_bulk(df_weekly, enrichment_map=None):
     """
     Write weekly aggregated metrics to HBase using batch writes.
     Also stores the latest week data for velocity calculation in next run.
+    Enriches with real-time GitHub API star/fork counts when available.
 
     Row key: week#repo_name
-    Column families: repo (name, language) / stats (stars, forks, velocity)
+    Column families: repo (name, language) / stats (stars, forks, velocity, api_stars, api_forks)
     """
     rows = df_weekly.collect()
     log.info(f"Bulk writing {len(rows)} rows to weekly_metrics...")
@@ -214,7 +236,12 @@ def write_weekly_metrics_bulk(df_weekly, language_map=None):
         repo_key   = build_repo_key(repo_name)
 
         row_key = f"{week}#{repo_name}".encode("utf-8")
-        language = language_map.get(repo_name, "Unknown") if language_map else "Unknown"
+        
+        # Get enrichment data (language, real-time stars/forks from GitHub API)
+        enrichment = enrichment_map.get(repo_name, {}) if enrichment_map else {}
+        language = enrichment.get("language", "Unknown")
+        api_stars = str(enrichment.get("stargazers_count", 0))
+        api_forks = str(enrichment.get("forks_count", 0))
 
         # Main weekly metrics
         batch_puts.append((row_key, {
@@ -224,6 +251,8 @@ def write_weekly_metrics_bulk(df_weekly, language_map=None):
             b"stats:stars":     stars.encode("utf-8"),
             b"stats:forks":     forks.encode("utf-8"),
             b"stats:velocity":  velocity.encode("utf-8"),
+            b"stats:api_stars": api_stars.encode("utf-8"),
+            b"stats:api_forks": api_forks.encode("utf-8"),
             b"stats:week":      week.encode("utf-8"),
         }))
 
@@ -232,6 +261,8 @@ def write_weekly_metrics_bulk(df_weekly, language_map=None):
             last_week_puts.append((f"last_week_data_{repo_name}".encode("utf-8"), {
                 b"stats:last_stars": stars.encode("utf-8"),
                 b"stats:last_forks": forks.encode("utf-8"),
+                b"stats:last_api_stars": api_stars.encode("utf-8"),
+                b"stats:last_api_forks": api_forks.encode("utf-8"),
                 b"stats:last_week": week.encode("utf-8"),
             }))
 
@@ -344,15 +375,15 @@ def main():
 
     connection.close()
 
-    # ── Get top repos for language enrichment ───────────────
+    # ── Get top repos for enrichment ───────────────
     top_repos = weekly_with_velocity.orderBy(desc("velocity")).limit(200)
     repo_names = [row["repo_name"] for row in top_repos.collect()]
 
-    # ── Enrich with language (batch GraphQL) ─────────────────
-    language_map = batch_enrich_with_language(repo_names)
+    # ── Enrich with language, stars, and forks (batch GraphQL) ─────────────────
+    enrichment_map = batch_enrich_repos(repo_names)
 
     # ── Write to HBase (bulk write) ──────────────────────
-    write_weekly_metrics_bulk(weekly_with_velocity, language_map)
+    write_weekly_metrics_bulk(weekly_with_velocity, enrichment_map)
 
     log.info("Batch job complete")
     spark.stop()
