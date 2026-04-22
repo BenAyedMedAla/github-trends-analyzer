@@ -4,13 +4,18 @@ opentrend — batch_job.py
 Reads GH Archive .json.gz files from HDFS, computes weekly
 metrics per repo, and writes results to HBase.
 
-Run manually or triggered by scheduler.py weekly.
+Run manually or triggered by Airflow DAG weekly.
 
-Pipeline (TP1 MapReduce logic, rewritten in PySpark TP2 style):
+Pipeline:
   HDFS /user/root/gharchive/*.json.gz
     → PySpark (read + aggregate)
       → HBase: weekly_metrics  (star velocity per repo)
-      → HBase: ml_predictions  (simple trending score)
+
+Features:
+  - Incremental processing: skips already-processed weeks
+  - Actual velocity calculation: compares to previous week
+  - Bulk HBase writes for efficiency
+  - Batch GitHub API enrichment
 """
 
 import os
@@ -23,10 +28,9 @@ from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, count, sum as spark_sum,
-    when, lit, desc, round as spark_round
+    col, count, sum as spark_sum, lag, coalesce, lit, desc
 )
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env")
@@ -52,6 +56,48 @@ def resolve_input_path() -> str:
     return HDFS_INPUT
 
 
+def get_processed_weeks(connection) -> set:
+    """Get weeks already processed from HBase weekly_metrics."""
+    processed = set()
+    try:
+        table = connection.table("weekly_metrics")
+        for row_key, data in table.scan():
+            row_str = row_key.decode("utf-8")
+            week = row_str.split("#")[0]
+            processed.add(week)
+        log.info(f"Found {len(processed)} already processed weeks")
+    except Exception:
+        log.info("No weekly_metrics table found, starting fresh")
+    return processed
+
+
+def compute_actual_velocity(df_weekly, connection):
+    """
+    Compute actual velocity: stars this week - stars last week.
+    Also stores current week's data for next run's comparison.
+    """
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number, lead, coalesce, lit
+
+    window_spec = Window.partitionBy("repo_name").orderBy("week")
+
+    with_velocity = df_weekly.withColumn(
+        "prev_stars",
+        lag("star_count", 1).over(window_spec)
+    ).withColumn(
+        "velocity",
+        coalesce(col("star_count") - col("prev_stars"), col("star_count"))
+    ).withColumn(
+        "prev_forks",
+        lag("fork_count", 1).over(window_spec)
+    ).withColumn(
+        "fork_velocity",
+        coalesce(col("fork_count") - col("prev_forks"), col("fork_count"))
+    ).drop("prev_stars", "prev_forks")
+
+    return with_velocity
+
+
 def get_hbase_connection():
     return happybase.Connection(
         host=HBASE_HOST,
@@ -64,51 +110,100 @@ def build_repo_key(repo_name: str) -> bytes:
     """Build a deterministic, collision-safe repo key used across HBase tables."""
     return quote(repo_name, safe="").encode("utf-8")
 
-def enrich_with_language(df_top, spark):
+def batch_enrich_with_language(repo_names: list) -> dict:
     """
-    Call GitHub API to get language for each top repo.
-    Only enriches top 200 repos to stay within rate limits.
+    Call GitHub API to get language for each repo using batch GraphQL query.
+    Limits to 50 repos per request to avoid rate limits.
     """
     import requests
 
-    repo_names = [row["repo_name"] for row in df_top.collect()]
-    log.info(f"Fetching language for {len(repo_names)} repos...")
+    if not repo_names:
+        return {}
 
-    language_map = {}
+    language_map = {repo: "Unknown" for repo in repo_names}
     headers = {
-    "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
-    "Accept": "application/vnd.github+json"
-}
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github+json"
+    }
 
-    for repo in repo_names:
+    log.info(f"Fetching language for {len(repo_names)} repos via GraphQL...")
+
+    # Process in batches of 50
+    batch_size = 50
+    for i in range(0, len(repo_names), batch_size):
+        batch = repo_names[i:i + batch_size]
+
+        # Build GraphQL query for this batch
+        queries = "\n".join([f'{repo.split("/")[1]}: repository(owner: "{repo.split("/")[0]}", name: "{repo.split("/")[1]}") {{ language {{ name }} }}' for repo in batch])
+
+        query = f"""{{
+ {queries}
+}}"""
+
         try:
-            r = requests.get(
-                f"https://api.github.com/repos/{repo}",
-                headers=headers, timeout=5)
+            r = requests.post(
+                "https://api.github.com/graphql",
+                json={"query": query},
+                headers=headers,
+                timeout=30
+            )
+
             if r.status_code == 200:
-                language_map[repo] = r.json().get("language") or "Unknown"
-                print(f"Enriched {repo} with language: {language_map[repo]}")
+                data = r.json().get("data", {})
+                for repo in batch:
+                    try:
+                        key = repo.split("/")[1]
+                        lang_data = data.get(key, {})
+                        lang = lang_data.get("language", {})
+                        language_map[repo] = lang.get("name", "Unknown") if lang else "Unknown"
+                    except Exception:
+                        language_map[repo] = "Unknown"
             else:
-                language_map[repo] = "Unknown"
-                print(f"Failed to fetch {repo}: {r.status_code} - {r.text}")
-        except Exception:
-            language_map[repo] = "Unknown"
+                log.warning(f"GraphQL request failed: {r.status_code}")
+
+        except Exception as e:
+            log.warning(f"Error fetching languages: {e}")
+            # Fall back to individual requests
+            for repo in batch:
+                try:
+                    r = requests.get(
+                        f"https://api.github.com/repos/{repo}",
+                        headers=headers,
+                        timeout=5
+                    )
+                    if r.status_code == 200:
+                        language_map[repo] = r.json().get("language") or "Unknown"
+                except Exception:
+                    language_map[repo] = "Unknown"
 
     log.info("Language enrichment complete")
     return language_map
 
-def write_weekly_metrics(df_weekly,language_map=None):
+def write_weekly_metrics_bulk(df_weekly, language_map=None):
     """
-    Write weekly aggregated metrics to HBase weekly_metrics table.
+    Write weekly aggregated metrics to HBase using batch writes.
+    Also stores the latest week data for velocity calculation in next run.
 
-    Row key: week_date#repo_name
+    Row key: week#repo_name
     Column families: repo (name, language) / stats (stars, forks, velocity)
     """
     rows = df_weekly.collect()
-    log.info(f"Writing {len(rows)} rows to weekly_metrics...")
+    log.info(f"Bulk writing {len(rows)} rows to weekly_metrics...")
 
     connection = get_hbase_connection()
     table = connection.table("weekly_metrics")
+
+    # Prepare batch puts
+    batch_puts = []
+    last_week_puts = []
+
+    # Get max week from this run
+    max_week = None
+    for row in rows:
+        week = row["week"]
+        if week:
+            if max_week is None or week > max_week:
+                max_week = week
 
     for row in rows:
         repo_name  = row["repo_name"]  or "unknown"
@@ -120,7 +215,9 @@ def write_weekly_metrics(df_weekly,language_map=None):
 
         row_key = f"{week}#{repo_name}".encode("utf-8")
         language = language_map.get(repo_name, "Unknown") if language_map else "Unknown"
-        table.put(row_key, {
+
+        # Main weekly metrics
+        batch_puts.append((row_key, {
             b"repo:name":       repo_name.encode("utf-8"),
             b"repo:language":   language.encode("utf-8"),
             b"repo:key":        repo_key,
@@ -128,66 +225,30 @@ def write_weekly_metrics(df_weekly,language_map=None):
             b"stats:forks":     forks.encode("utf-8"),
             b"stats:velocity":  velocity.encode("utf-8"),
             b"stats:week":      week.encode("utf-8"),
-        })
+        }))
+
+        # Store last week's data for velocity calculation (use max week only)
+        if week == max_week:
+            last_week_puts.append((f"last_week_data_{repo_name}".encode("utf-8"), {
+                b"stats:last_stars": stars.encode("utf-8"),
+                b"stats:last_forks": forks.encode("utf-8"),
+                b"stats:last_week": week.encode("utf-8"),
+            }))
+
+    # Batch write main metrics
+    with table.batch() as batch:
+        for row_key, data in batch_puts:
+            batch.put(row_key, data)
+
+    # Batch write last week reference data
+    if last_week_puts:
+        last_week_table = connection.table("weekly_metrics")
+        with last_week_table.batch() as batch:
+            for row_key, data in last_week_puts:
+                batch.put(row_key, data)
 
     connection.close()
-    log.info("weekly_metrics write complete")
-
-
-def write_ml_predictions(df_predictions):
-    """
-    Write ML trending predictions to HBase ml_predictions table.
-
-    Simple scoring model:
-      - velocity > 10  → high probability trending
-      - velocity > 5   → medium
-      - else           → low
-
-    Row key: repo_name
-    Column families: repo (name) / ml (score, cluster, predicted_growth)
-    """
-    rows = df_predictions.collect()
-    log.info(f"Writing {len(rows)} rows to ml_predictions...")
-
-    connection = get_hbase_connection()
-    table = connection.table("ml_predictions")
-
-    for row in rows:
-        repo_name = row["repo_name"] or "unknown"
-        velocity  = row["velocity"]  or 0
-        stars     = row["star_count"] or 0
-        repo_key  = build_repo_key(repo_name)
-
-        # Simple trending probability score (0.0 to 1.0)
-        if velocity > 10:
-            probability = 0.9
-            cluster     = "Rocket repo"
-        elif velocity > 5:
-            probability = 0.6
-            cluster     = "Rising repo"
-        elif velocity > 2:
-            probability = 0.35
-            cluster     = "Steady grower"
-        else:
-            probability = 0.1
-            cluster     = "Low activity"
-
-        # Predicted growth = velocity * 1.2 (simple linear projection)
-        predicted_growth = int(velocity * 1.2)
-
-        row_key = repo_name.encode("utf-8")
-
-        table.put(row_key, {
-            b"repo:name":            repo_name.encode("utf-8"),
-            b"repo:key":             repo_key,
-            b"ml:probability":       str(probability).encode("utf-8"),
-            b"ml:cluster":           cluster.encode("utf-8"),
-            b"ml:predicted_growth":  str(predicted_growth).encode("utf-8"),
-            b"ml:velocity":          str(velocity).encode("utf-8"),
-        })
-
-    connection.close()
-    log.info("ml_predictions write complete")
+    log.info("weekly_metrics bulk write complete")
 
 
 def main():
@@ -206,9 +267,12 @@ def main():
     spark.sparkContext.setLogLevel("WARN")
     log.info("Spark session created")
 
+    # ── Get already processed weeks from HBase ────────────────
+    connection = get_hbase_connection()
+    processed_weeks = get_processed_weeks(connection)
+    log.info(f"Skipping already processed weeks: {processed_weeks}")
+
     # ── Read GH Archive files from HDFS ───────────────────────
-    # GH Archive files are JSON (one event per line) inside .gz
-    # Spark reads them natively — same as TP1 HDFS file read
     log.info("Reading GH Archive files...")
     try:
         raw = spark.read.option("badRecordsPath", "/tmp/bad_records").json(input_path)
@@ -216,7 +280,6 @@ def main():
         log.error(f"Failed to read GH Archive input: {e}")
         log.error(f"Checked HDFS path:  {HDFS_INPUT}")
         log.warning("Attempting to read valid files only...")
-        # Try reading with permissive mode to skip corrupted files
         try:
             raw = spark.read.option("badRecordsPath", "/tmp/bad_records").option("mode", "PERMISSIVE").json(input_path)
             log.info(f"Recovered: read {raw.count()} valid events after skipping corrupted files")
@@ -226,16 +289,13 @@ def main():
 
     log.info(f"Total events loaded: {raw.count()}")
 
-    # ── Filter relevant events ─────────────────────────────────
+    # ── Filter relevant events (WatchEvent and ForkEvent ONLY) ──
     relevant = raw.filter(
-        col("type").isin(
-            "WatchEvent", "ForkEvent", "PushEvent", "CreateEvent"
-        )
+        col("type").isin(["WatchEvent", "ForkEvent"])
     )
 
     # ── Extract week from created_at ───────────────────────────
-    # Use substring to get YYYY-MM-DD, then truncate to week start
-    from pyspark.sql.functions import date_trunc, to_timestamp, substring
+    from pyspark.sql.functions import date_trunc, to_timestamp
 
     events = relevant.select(
         col("type").alias("event_type"),
@@ -248,9 +308,7 @@ def main():
         ).cast("string").alias("week")
     )
 
-    # ── Weekly aggregation per repo ────────────────────────────
-    # Count stars (WatchEvents) and forks per repo per week
-    # Same MapReduce logic as TP1 WordCount but for repos
+    # ── Initial aggregation per repo per week ────────────────────
     weekly = (
         events
         .groupBy("week", "repo_name")
@@ -263,33 +321,38 @@ def main():
             ).alias("fork_count"),
             count("*").alias("total_events")
         )
-        .orderBy(desc("star_count"))
     )
 
-    # ── Compute velocity ───────────────────────────────────────
-    # Velocity = star_count (simple: stars gained this week)
-    # In a real system you'd compare to previous week
-    weekly_with_velocity = weekly.withColumn(
-        "velocity", col("star_count")
-    )
+    # ── Skip already processed weeks ─────────────────────────
+    if processed_weeks:
+        weekly = weekly.filter(~col("week").isin(*processed_weeks))
+
+    # Check if there's data to process
+    if weekly.count() == 0:
+        log.info("No new weeks to process. Exiting.")
+        spark.stop()
+        return
+
+    # ── Compute actual velocity (compare to previous week) ───
+    weekly_with_velocity = compute_actual_velocity(weekly, connection)
+
+    # Sort for display and processing
+    weekly_with_velocity = weekly_with_velocity.orderBy(desc("velocity"))
 
     log.info("Weekly aggregation complete")
     weekly_with_velocity.show(10, truncate=False)
 
-    # ── Get top 200 repos by velocity ─────────────────────────
+    connection.close()
 
-    top_repos = weekly_with_velocity.orderBy(
-        desc("velocity")
-    ).limit(200)
-    language_map = enrich_with_language(top_repos, spark)
+    # ── Get top repos for language enrichment ───────────────
+    top_repos = weekly_with_velocity.orderBy(desc("velocity")).limit(200)
+    repo_names = [row["repo_name"] for row in top_repos.collect()]
 
-    # ── Write to HBase ─────────────────────────────────────────
-    write_weekly_metrics(weekly_with_velocity, language_map)
+    # ── Enrich with language (batch GraphQL) ─────────────────
+    language_map = batch_enrich_with_language(repo_names)
 
-    # ── ML predictions — top 200 repos only ───────────────────
-  
-
-    write_ml_predictions(top_repos)
+    # ── Write to HBase (bulk write) ──────────────────────
+    write_weekly_metrics_bulk(weekly_with_velocity, language_map)
 
     log.info("Batch job complete")
     spark.stop()

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import os
 
 from airflow import DAG
 from airflow.operators.bash import BashOperator
@@ -20,6 +21,8 @@ with DAG(
     },
     tags=["opentrend", "hdfs", "spark"],
 ) as dag:
+    gharchive_days_back = int(os.getenv("GHARCHIVE_DAYS_BACK", "7"))
+
     check_runtime_dependencies = BashOperator(
         task_id="check_runtime_dependencies",
         bash_command="command -v docker >/dev/null 2>&1",
@@ -34,7 +37,7 @@ with DAG(
             "workdir=/tmp/gharchive-batch\n"
             "mkdir -p \"$workdir\"\n"
             "cd \"$workdir\"\n"
-            "for offset in 1 2 3 4 5 6 7; do\n"
+            f"for offset in $(seq 1 {gharchive_days_back}); do\n"
             "  day=$(date -u -d \"-$offset day\" +%Y-%m-%d)\n"
             "  daily=\"$day.json.gz\"\n"
             "  if wget -q -O \"$daily\" \"https://data.gharchive.org/$daily\"; then\n"

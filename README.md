@@ -246,6 +246,8 @@ It:
 - runs weekly on Monday at 02:00
 
 Use Airflow as the single scheduler and remove duplicate schedulers.
+
+If you want a faster test run, set `GHARCHIVE_DAYS_BACK=1` in the Airflow container environment before starting Airflow. The default is `7`.
  
 | Service | URL |
 |---|---|
