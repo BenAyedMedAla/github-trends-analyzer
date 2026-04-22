@@ -51,7 +51,7 @@ opentrend/
  
 ```bash
 git clone https://github.com/your-username/opentrend.git
-cd opentrend
+cd github-trends-analyzer
 ```
  
 ### 2. Set up your environment
