@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    col, count, sum as spark_sum, lag, coalesce, lit, desc
+    col, count, sum as spark_sum, lag, coalesce, lit, desc, when
 )
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 
@@ -41,7 +41,12 @@ HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 HDFS_HOST   = os.getenv("HDFS_HOST",   "hadoop-master:9000")
 GHARCHIVE_HDFS_PATH = os.getenv("GHARCHIVE_HDFS_PATH", "/user/root/gharchive")
-HDFS_INPUT  = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/*.json.gz"
+DEBUG_DAY = os.getenv("DEBUG_DAY", "")  # For testing single day: "2026-04-13"
+if DEBUG_DAY:
+    HDFS_INPUT = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/{DEBUG_DAY}.json.gz"
+    print(f"DEBUG: Processing single day {DEBUG_DAY}")
+else:
+    HDFS_INPUT  = f"hdfs://{HDFS_HOST}{GHARCHIVE_HDFS_PATH}/*.json.gz"
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -111,6 +116,36 @@ def build_repo_key(repo_name: str) -> bytes:
     """Build a deterministic, collision-safe repo key used across HBase tables."""
     return quote(repo_name, safe="").encode("utf-8")
 
+
+def lookup_repo_languages(repo_names: list) -> dict:
+    """
+    Prefer repo language data already written by the streaming job in the repos table.
+    This avoids depending on GitHub API enrichment when streaming has already resolved
+    the language label.
+    """
+    if not repo_names:
+        return {}
+
+    connection = get_hbase_connection()
+    repos_table = connection.table("repos")
+    result = {}
+
+    try:
+        for repo_name in repo_names:
+            repo_key = build_repo_key(repo_name)
+            row = repos_table.row(repo_key)
+            language = (
+                row.get(b"info:language", b"")
+                .decode("utf-8", errors="ignore")
+                .strip()
+            )
+            if language:
+                result[repo_name] = language
+    finally:
+        connection.close()
+
+    return result
+
 def batch_enrich_repos(repo_names: list) -> dict:
     """
     Enrich repos with language, stargazers_count, and forks_count from GitHub API.
@@ -126,27 +161,54 @@ def batch_enrich_repos(repo_names: list) -> dict:
         repo: {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
         for repo in repo_names
     }
+
+    # First hydrate from the streaming pipeline's repos table.
+    hbase_languages = lookup_repo_languages(repo_names)
+    for repo, language in hbase_languages.items():
+        enrichment_map[repo]["language"] = language
+
+    repos_to_query = [
+        repo for repo in repo_names
+        if enrichment_map.get(repo, {}).get("language") in ("", "Unknown", None)
+    ]
+
+    if not repos_to_query:
+        log.info("Repo languages already present in HBase; skipping GraphQL enrichment")
+        return enrichment_map
+
     headers = {
         "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
         "Accept": "application/vnd.github+json"
     }
 
-    log.info(f"Enriching {len(repo_names)} repos with language, stars, and forks via GraphQL...")
+    log.info(f"Enriching {len(repos_to_query)} repos with language, stars, and forks via GraphQL...")
 
     # Process in batches of 50
     batch_size = 50
-    for i in range(0, len(repo_names), batch_size):
-        batch = repo_names[i:i + batch_size]
+    for i in range(0, len(repos_to_query), batch_size):
+        batch = repos_to_query[i:i + batch_size]
 
-        # Build GraphQL query for this batch
-        queries = "\n".join([
-            f'{repo.split("/")[1]}: repository(owner: "{repo.split("/")[0]}", name: "{repo.split("/")[1]}") {{ language {{ name }} stargazersCount forks(first: 0) {{ totalCount }} }}'
-            for repo in batch
-        ])
+        # Build GraphQL query for this batch with safe aliases (r0, r1, ...).
+        # Repo names may contain characters that are invalid as GraphQL aliases.
+        alias_to_repo = {}
+        queries = []
+        for idx, repo in enumerate(batch):
+            try:
+                owner, name = repo.split("/", 1)
+            except ValueError:
+                continue
+            alias = f"r{idx}"
+            alias_to_repo[alias] = repo
+            queries.append(
+                f'{alias}: repository(owner: "{owner}", name: "{name}") {{ language {{ name }} stargazersCount forkCount }}'
+            )
 
-        query = f"""{{
- {queries}
-}}"""
+        if not queries:
+            continue
+
+        query = "{\n" + "\n".join(queries) + "\n}"
+
+        unresolved = list(batch)
 
         try:
             r = requests.post(
@@ -157,48 +219,150 @@ def batch_enrich_repos(repo_names: list) -> dict:
             )
 
             if r.status_code == 200:
-                data = r.json().get("data", {})
-                for repo in batch:
+                payload = r.json()
+                data = payload.get("data", {}) or {}
+                errors = payload.get("errors", []) or []
+
+                if errors:
+                    log.warning(f"GraphQL returned {len(errors)} errors in current batch")
+
+                resolved = set()
+                for alias, repo in alias_to_repo.items():
                     try:
-                        key = repo.split("/")[1]
-                        repo_data = data.get(key, {})
+                        repo_data = data.get(alias)
+                        if not repo_data:
+                            continue
                         lang = repo_data.get("language", {})
                         language = lang.get("name", "Unknown") if lang else "Unknown"
                         stargazers = repo_data.get("stargazersCount", 0) or 0
-                        forks_obj = repo_data.get("forks", {})
-                        forks = forks_obj.get("totalCount", 0) or 0
+                        forks = repo_data.get("forkCount", 0) or 0
                         enrichment_map[repo] = {
                             "language": language,
                             "stargazers_count": stargazers,
-                            "forks_count": forks
+                            "forks_count": forks,
                         }
+                        resolved.add(repo)
                     except Exception:
-                        enrichment_map[repo] = {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
+                        pass
+
+                unresolved = [repo for repo in batch if repo not in resolved]
             else:
                 log.warning(f"GraphQL request failed: {r.status_code}")
+                unresolved = list(batch)
 
         except Exception as e:
             log.warning(f"Error enriching repos: {e}")
-            # Fall back to individual REST requests
-            for repo in batch:
-                try:
-                    r = requests.get(
-                        f"https://api.github.com/repos/{repo}",
-                        headers=headers,
-                        timeout=5
-                    )
-                    if r.status_code == 200:
-                        repo_json = r.json()
-                        enrichment_map[repo] = {
-                            "language": repo_json.get("language") or "Unknown",
-                            "stargazers_count": repo_json.get("stargazers_count") or 0,
-                            "forks_count": repo_json.get("forks_count") or 0
-                        }
-                except Exception:
-                    enrichment_map[repo] = {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
+            unresolved = list(batch)
+
+        # Fall back to individual REST requests for unresolved repos.
+        for repo in unresolved:
+            if enrichment_map.get(repo, {}).get("language") not in ("", "Unknown", None):
+                continue
+            try:
+                r = requests.get(
+                    f"https://api.github.com/repos/{repo}",
+                    headers=headers,
+                    timeout=5
+                )
+                if r.status_code == 200:
+                    repo_json = r.json()
+                    enrichment_map[repo] = {
+                        "language": repo_json.get("language") or "Unknown",
+                        "stargazers_count": repo_json.get("stargazers_count") or 0,
+                        "forks_count": repo_json.get("forks_count") or 0,
+                    }
+            except Exception:
+                enrichment_map[repo] = {"language": "Unknown", "stargazers_count": 0, "forks_count": 0}
 
     log.info("Repo enrichment complete")
     return enrichment_map
+
+
+def backfill_unknown_languages(limit_rows: int = 5000):
+    """
+    Backfill Unknown languages for existing weekly rows when there is no new week.
+    This keeps Streamlit language panels usable even on repeated runs.
+    """
+    connection = get_hbase_connection()
+    table = connection.table("weekly_metrics")
+    repos_table = connection.table("repos")
+    import requests
+
+    to_update = []
+    repos = set()
+
+    for row_key, cells in table.scan(limit=limit_rows):
+        row_str = row_key.decode("utf-8", errors="ignore")
+        if "#" not in row_str:
+            continue
+
+        repo_name = cells.get(b"repo:name", b"").decode("utf-8", errors="ignore")
+        if not repo_name:
+            repo_name = row_str.split("#", 1)[1]
+
+        lang = cells.get(b"repo:language", b"").decode("utf-8", errors="ignore").strip()
+        if lang and lang != "Unknown":
+            continue
+
+        to_update.append((row_key, repo_name))
+        repos.add(repo_name)
+
+    if not to_update:
+        log.info("No Unknown languages to backfill")
+        connection.close()
+        return
+
+    log.info(f"Backfilling language for {len(to_update)} rows ({len(repos)} repos)")
+
+    # Language backfill does not need star/fork enrichment. Prefer HBase first,
+    # then fall back to the REST repo endpoint for the few repos still missing.
+    hbase_languages = lookup_repo_languages(list(repos))
+    api_languages = {}
+    headers = {
+        "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    missing_repos = [repo for repo in repos if repo not in hbase_languages]
+    for repo_name in missing_repos:
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{repo_name}",
+                headers=headers,
+                timeout=10
+            )
+            if r.status_code == 200:
+                repo_json = r.json()
+                language = (repo_json.get("language") or "").strip()
+                if language:
+                    api_languages[repo_name] = language
+        except Exception:
+            continue
+
+    updates = 0
+    with table.batch() as batch:
+        for row_key, repo_name in to_update:
+            language = hbase_languages.get(repo_name, "")
+            if not language:
+                repo_row = repos_table.row(build_repo_key(repo_name))
+                language = (
+                    repo_row.get(b"info:language", b"")
+                    .decode("utf-8", errors="ignore")
+                    .strip()
+                )
+            if not language:
+                language = api_languages.get(repo_name, "")
+
+            if not language or language == "Unknown":
+                continue
+
+            payload = {b"repo:language": language.encode("utf-8")}
+
+            batch.put(row_key, payload)
+            updates += 1
+
+    connection.close()
+    log.info(f"Language backfill updated {updates} rows")
 
 def write_weekly_metrics_bulk(df_weekly, enrichment_map=None):
     """
@@ -360,6 +524,8 @@ def main():
 
     # Check if there's data to process
     if weekly.count() == 0:
+        log.info("No new weeks to process. Running language backfill for existing rows...")
+        backfill_unknown_languages(limit_rows=10000)
         log.info("No new weeks to process. Exiting.")
         spark.stop()
         return

@@ -56,12 +56,19 @@ def scan_rows(
         conn = get_connection()
         try:
             table = conn.table(table_name)
-            rows = table.scan(row_prefix=prefix_bytes, limit=limit, reverse=latest_first)
+            # Some HBase/Thrift combinations return empty results when the "reverse"
+            # scan flag is provided. Use a forward scan for compatibility and sort
+            # by row key in memory when latest-first ordering is requested.
+            rows = table.scan(row_prefix=prefix_bytes)
             result: List[Tuple[str, Dict[str, str]]] = []
             for row_key, cells in rows:
                 result.append(
                     (row_key.decode("utf-8", errors="ignore"), decode_cell_map(cells))
                 )
+            if latest_first:
+                result.sort(key=lambda x: x[0], reverse=True)
+            if limit > 0:
+                result = result[:limit]
             return result
         finally:
             conn.close()
@@ -112,10 +119,23 @@ def get_live_events(limit: int = 30) -> pd.DataFrame:
 
 def get_weekly_metrics(limit: int = 200) -> pd.DataFrame:
     try:
-        rows = scan_rows("weekly_metrics", limit=limit, latest_first=True)
+        # Read all rows first so helper snapshot rows do not consume the caller limit.
+        rows = scan_rows("weekly_metrics", limit=0, latest_first=True)
     except Exception:
         return pd.DataFrame()
-    return rows_to_dataframe(rows)
+    df = rows_to_dataframe(rows)
+    if df.empty:
+        return df
+
+    # Ignore helper rows used for "last week" snapshots.
+    # Weekly analytics panels expect rows with the standard week#repo key.
+    if "row_key" in df.columns:
+        df = df[df["row_key"].astype(str).str.contains("#", regex=False)]
+
+    if limit > 0:
+        df = df.head(limit)
+
+    return df
 
 
 def get_ml_predictions(limit: int = 20) -> pd.DataFrame:
@@ -185,8 +205,10 @@ def activity_feed_df(limit: int = 20) -> pd.DataFrame:
 
 
 def language_stats_df() -> pd.DataFrame:
-    df = get_weekly_metrics(limit=2000)
-    if df.empty:
+    # Use full weekly dataset so all batch panels are consistent.
+    df = get_weekly_metrics(limit=0)
+    required_cols = {"stats:week", "stats:stars", "stats:forks", "repo:language"}
+    if df.empty or not required_cols.issubset(set(df.columns)):
         return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
     def _safe(v):
@@ -199,22 +221,56 @@ def language_stats_df() -> pd.DataFrame:
     df["_stars"] = df["stats:stars"].apply(_safe)
     df["_forks"] = df["stats:forks"].apply(_safe)
 
-    records = []
-    for lang, grp in df.groupby("repo:language"):
-        this_wk = grp["_stars"].sum()
-        last_wk = int(this_wk * 0.88)
-        records.append({"language": lang, "thisWeek": this_wk, "lastWeek": last_wk})
+    # Normalize language labels so empty values are still visible in charts.
+    df["_language"] = df["repo:language"].apply(
+        lambda v: str(v).strip() if str(v).strip() else "Unknown"
+    )
 
-    result = pd.DataFrame(records)
+    # Keep Unknown only when it is the only available language bucket.
+    non_unknown_count = (df["_language"] != "Unknown").sum()
+    if non_unknown_count > 0:
+        df = df[df["_language"] != "Unknown"]
+
+    weeks = sorted([w for w in df["_week"].unique() if w is not None])
+    if not weeks:
+        return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
+
+    current_week = weeks[-1]
+    previous_week = weeks[-2] if len(weeks) >= 2 else None
+
+    current = (
+        df[df["_week"] == current_week]
+        .groupby("_language", as_index=False)["_stars"]
+        .sum()
+        .rename(columns={"_language": "language", "_stars": "thisWeek"})
+    )
+
+    if previous_week is not None:
+        previous = (
+            df[df["_week"] == previous_week]
+            .groupby("_language", as_index=False)["_stars"]
+            .sum()
+            .rename(columns={"_language": "language", "_stars": "lastWeek"})
+        )
+        result = current.merge(previous, on="language", how="left")
+    else:
+        result = current.copy()
+        result["lastWeek"] = 0
+
+    result["lastWeek"] = result["lastWeek"].fillna(0).astype(int)
+    result["thisWeek"] = result["thisWeek"].fillna(0).astype(int)
+
     if not result.empty:
         result = result.sort_values("thisWeek", ascending=False).reset_index(drop=True)
     return result
 
 
 def historical_df() -> pd.DataFrame:
-    df = get_weekly_metrics(limit=5000)
-    if df.empty:
-        return pd.DataFrame(columns=["day", "Python", "TypeScript", "Rust", "Go", "Java"])
+    # Use same complete dataset as language_stats_df for coherent charts.
+    df = get_weekly_metrics(limit=0)
+    required_cols = {"stats:week", "stats:stars", "repo:language"}
+    if df.empty or not required_cols.issubset(set(df.columns)):
+        return pd.DataFrame(columns=["day"])
 
     def _safe(v):
         try:
@@ -229,28 +285,44 @@ def historical_df() -> pd.DataFrame:
         lambda x: str(x)[:10] if len(str(x)) >= 10 else "?"
     )
 
-    languages = ["Python", "TypeScript", "Rust", "Go", "Java"]
+    df["_language"] = df["repo:language"].apply(
+        lambda v: str(v).strip() if str(v).strip() else "Unknown"
+    )
+
+    # Keep Unknown only when no concrete language labels are available.
+    non_unknown_count = (df["_language"] != "Unknown").sum()
+    if non_unknown_count > 0:
+        df = df[df["_language"] != "Unknown"]
+
+    lang_totals = (
+        df.groupby("_language")["_stars"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+    languages = lang_totals.head(5).index.tolist()
+
+    if not languages:
+        return pd.DataFrame(columns=["day"])
+
     records = []
     for day, grp in df.groupby("_day"):
-        lang_totals = grp.groupby("repo:language")["_stars"].sum()
+        day_lang_totals = grp.groupby("_language")["_stars"].sum()
         record = {"day": day}
         for lang in languages:
-            record[lang] = int(lang_totals.get(lang, 0))
+            record[lang] = int(day_lang_totals.get(lang, 0))
         records.append(record)
 
     result = pd.DataFrame(records)
     if not result.empty:
         result = result.sort_values("day").reset_index(drop=True)
-        for lang in languages:
-            if lang not in result.columns:
-                result[lang] = 0
         result = result[["day", *languages]]
     return result
 
 
 def trending_weekly_df(limit: int = 10) -> pd.DataFrame:
     df = get_weekly_metrics(limit=2000)
-    if df.empty:
+    required_cols = {"stats:stars", "stats:forks"}
+    if df.empty or not required_cols.issubset(set(df.columns)):
         return pd.DataFrame(columns=["repo", "language", "score", "stars", "forks"])
 
     def _safe(v):
@@ -581,6 +653,20 @@ def render_rising_languages(df: pd.DataFrame):
         st.html(panel_html)
         return
 
+    # When enrichment has not resolved languages yet, avoid rendering a misleading chart.
+    if set(df["language"].astype(str).str.strip().tolist()) == {"Unknown"}:
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+            </div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language this week</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Language enrichment is still in progress. Weekly stars are available, but language labels are not resolved yet.</div>
+        </div>"""
+        st.html(panel_html)
+        return
+
     chart_df = df.head(8).copy().set_index("language")[["thisWeek", "lastWeek"]]
 
     panel_html = f"""
@@ -596,7 +682,7 @@ def render_rising_languages(df: pd.DataFrame):
 
 
 def render_historical_trends(df: pd.DataFrame):
-    if df.empty:
+    if df.empty or len(df.columns) <= 1:
         panel_html = """
         <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
@@ -609,7 +695,21 @@ def render_historical_trends(df: pd.DataFrame):
         st.html(panel_html)
         return
 
-    languages = ["Python", "TypeScript", "Rust", "Go", "Java"]
+    only_unknown = len(df.columns) == 2 and "Unknown" in df.columns
+    if only_unknown:
+        panel_html = """
+        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
+                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
+                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+            </div>
+            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
+            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Historical stars are available, but language labels are unresolved (Unknown only). Run one more batch after enrichment to see per-language history.</div>
+        </div>"""
+        st.html(panel_html)
+        return
+
+    languages = [c for c in df.columns if c != "day"]
     chart_df = df.copy().set_index("day")[languages]
 
     panel_html = f"""
