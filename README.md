@@ -50,7 +50,92 @@ GITHUB_TOKEN=ghp_yourtoken
  
 A GitHub personal access token is free — generate one at github.com/settings/tokens with no scopes required. It raises your API limit from 60 to 5,000 requests/hour.
  
-### 3. Load batch data into HDFS (optional fallback)
+### 3. Start Hadoop, Kafka, and HBase
+
+Start the Hadoop master container first:
+
+```bash
+docker exec -it hadoop-master bash
+```
+
+Inside `hadoop-master`, start the services in this order:
+
+```bash
+./start-hadoop.sh
+./start-kafka-zookeeper.sh
+./start-kafka-zookeeper.sh
+start-hbase.sh
+hbase-daemon.sh start thrift
+```
+
+Check the processes with `jps`. You should see:
+
+- `NameNode`
+- `SecondaryNameNode`
+- `ResourceManager`
+- `Kafka`
+- `QuorumPeerMain`
+- `HMaster`
+- `HRegionServer`
+- `ThriftServer`
+
+### 4. Create the Kafka topic
+
+Still inside `hadoop-master`, create the `github-events` topic:
+
+```bash
+kafka-topics.sh --create --topic github-events --replication-factor 1 --partitions 1 --bootstrap-server localhost:9092
+```
+
+List topics to confirm it exists:
+
+```bash
+kafka-topics.sh --list --bootstrap-server localhost:9092
+```
+
+You should see:
+
+- `github-events`
+
+### 5. Create the HBase tables
+
+Open the HBase shell:
+
+```bash
+hbase shell
+```
+
+Create the tables used by the batch and dashboard:
+
+```hbase
+create 'live_events', 'event'
+create 'live_metrics', 'repo', 'metrics'
+create 'repos', 'info'
+create 'weekly_metrics', 'repo', 'stats'
+create 'ml_predictions', 'repo', 'ml'
+```
+
+List the tables to confirm:
+
+```hbase
+list
+```
+
+You should see at least:
+
+- `live_events`
+- `live_metrics`
+- `repos`
+- `weekly_metrics`
+- `ml_predictions`
+
+Exit HBase shell with:
+
+```hbase
+exit
+```
+
+### 6. Load batch data into HDFS (optional fallback)
 
 ```bash
 # inside hadoop-master container (example: one full day, hourly files)
@@ -61,7 +146,7 @@ done
 hdfs dfs -put -f 2024-01-15-*.json.gz /user/root/gharchive/
 ```
  
-### 4. Start everything
+### 7. Start the app containers
  
 ```bash
 docker compose up --build
@@ -76,19 +161,79 @@ docker compose --profile airflow up -d airflow
 Airflow UI: http://localhost:8080
 Default credentials: `admin` / `admin`
 
-### 5. Run the weekly batch manually (HDFS input only)
+### 8. Run the weekly batch manually from Airflow
 
-After GH Archive files are present under `hdfs:///user/root/gharchive/`, run:
+After Airflow starts, you can trigger the batch DAG from the UI or by command.
+
+Trigger from the Airflow UI:
+
+- open DAG `hdfs_weekly_batch`
+- click `Trigger DAG`
+
+Trigger from the terminal:
 
 ```bash
-docker compose --profile batch run --rm spark-batch
+docker exec opentrend-airflow airflow dags trigger hdfs_weekly_batch
 ```
+
+The DAG will:
+- download the last 7 full days of GH Archive data
+- upload them into HDFS at `/user/root/gharchive`
+- verify the HDFS input exists
+- run the Spark batch job
 
 The batch job writes into HBase tables used by Streamlit:
 - `weekly_metrics`
 - `ml_predictions`
 
-### 6. Airflow orchestration (recommended)
+### 9. Useful commands to watch the batch
+
+Check DAG runs:
+
+```bash
+docker exec opentrend-airflow airflow dags list-runs -d hdfs_weekly_batch --no-backfill
+```
+
+Check task states for a specific run:
+
+```bash
+docker exec opentrend-airflow airflow tasks states-for-dag-run hdfs_weekly_batch "manual__YYYY-MM-DDTHH:MM:SS+00:00"
+```
+
+Tail the ingestion task log:
+
+```bash
+docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_weekly_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=ingest_last_7_days_to_hdfs/attempt=1.log"
+```
+
+Tail the Spark batch task log:
+
+```bash
+docker exec opentrend-airflow bash -lc "tail -n 80 /opt/airflow/logs/dag_id=hdfs_weekly_batch/run_id=manual__YYYY-MM-DDTHH:MM:SS+00:00/task_id=run_spark_batch/attempt=1.log"
+```
+
+Watch Spark container output directly:
+
+```bash
+docker logs -f opentrend-spark
+```
+
+Watch Airflow output directly:
+
+```bash
+docker logs -f opentrend-airflow
+```
+
+Check HBase tables after the run:
+
+```bash
+hbase shell
+scan 'weekly_metrics'
+scan 'ml_predictions'
+exit
+```
+
+### 10. Airflow orchestration details
 
 An example DAG is provided at `airflow/dags/hdfs_weekly_batch.py`.
 
@@ -101,14 +246,6 @@ It:
 - runs weekly on Monday at 02:00
 
 Use Airflow as the single scheduler and remove duplicate schedulers.
-
-To run it once manually from Airflow UI:
-- open DAG `hdfs_weekly_batch`
-- click `Trigger DAG`
-
-This trigger now performs full automation:
-- ingestion (GH Archive -> HDFS)
-- weekly Spark batch execution
  
 | Service | URL |
 |---|---|
