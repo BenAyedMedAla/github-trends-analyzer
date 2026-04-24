@@ -7,7 +7,7 @@ Built as a university big data project. Combines a live GitHub event stream with
  
 ## What it does
  
-- **Stream side** — polls the GitHub Events API every 60 seconds, pushes events through Kafka, and uses Spark Structured Streaming to compute trending repositories in 10-minute windows
+- **Stream side** — polls the GitHub Events API every 5 seconds, pushes events through Kafka, and uses Spark Structured Streaming to compute trending repositories in 5-minute windows
 - **Batch side** — reads the previous day's GitHub Archive data every day at 02:00, runs PySpark to compute star velocity and rising languages, and scores repositories with a machine learning model
 - **Dashboard** — a streamlit app showing 6 live panels: trending now repos, rising languages, live event feed, historical trends, trending yesterday repos, and AI-predicted breakouts
  
@@ -30,8 +30,8 @@ Built as a university big data project. Combines a live GitHub event stream with
 ### 1. Clone the repo
  
 ```bash
-git clone https://github.com/your-username/opentrend.git
-cd opentrend
+git clone https://github.com/BenAyedMedAla/github-trends-analyzer
+cd github-trends-analyzer
 ```
  
 ### 2. Set up your environment
@@ -55,7 +55,25 @@ Optional: keep `GITHUB_TOKEN` as a shared fallback token if you do not want to s
  
 ### 3. Start Hadoop, Kafka, and HBase
 
-Start the Hadoop master container first:
+If the Hadoop containers are not running yet, start them:
+
+```bash
+docker run -itd --net=hadoop \
+	-p 9870:9870 -p 8088:8088 -p 7077:7077 \
+	-p 16010:16010 -p 9092:9092 -p 16000:16000 \
+	--name hadoop-master --hostname hadoop-master \
+	liliasfaxi/hadoop-cluster:latest
+
+docker run -itd --net=hadoop -p 8040:8042 \
+	--name hadoop-worker1 --hostname hadoop-worker1 \
+	liliasfaxi/hadoop-cluster:latest
+
+docker run -itd --net=hadoop -p 8041:8042 \
+	--name hadoop-worker2 --hostname hadoop-worker2 \
+	liliasfaxi/hadoop-cluster:latest
+```
+
+Then enter the Hadoop master container:
 
 ```bash
 docker exec -it hadoop-master bash
@@ -125,7 +143,7 @@ List the tables to confirm:
 list
 ```
 
-You should see at least:
+You should see:
 
 - `live_events`
 - `live_metrics`
@@ -140,21 +158,10 @@ Exit HBase shell with:
 exit
 ```
 
-### 6. Load batch data into HDFS (optional fallback)
-
-```bash
-# inside hadoop-master container (example: one full day, hourly files)
-hdfs dfs -mkdir -p /user/root/gharchive
-for h in {0..23}; do
-	wget https://data.gharchive.org/2024-01-15-$h.json.gz
-done
-hdfs dfs -put -f 2024-01-15-*.json.gz /user/root/gharchive/
-```
- 
 ### 7. Start the app containers
  
 ```bash
-docker compose up --build
+docker compose up --build 
 ```
 
 Start Airflow (scheduler + web UI):
@@ -164,7 +171,7 @@ docker compose --profile airflow up -d airflow
 ```
 
 Airflow UI: http://localhost:8080
-Default credentials: `admin` / `admin`
+Default credentials: you get them from the airflow container logs
 
 ### 8. Run the daily batch manually from Airflow
 
@@ -188,7 +195,7 @@ The DAG will:
 - run the Spark batch job
 
 The batch job writes into HBase tables used by Streamlit:
-- `weekly_metrics`
+- `batch_metadata`
 - `ml_predictions`
 
 ### 9. Useful commands to watch the batch
@@ -233,7 +240,7 @@ Check HBase tables after the run:
 
 ```bash
 hbase shell
-scan 'weekly_metrics'
+scan 'batch_metadata'
 scan 'ml_predictions'
 exit
 ```
