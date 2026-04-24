@@ -36,7 +36,7 @@ cd opentrend
  
 ### 2. Set up your environment
  
-Copy the example env file and add your GitHub token:
+Copy the example env file and add your GitHub tokens:
  
 ```bash
 cp .env.example .env
@@ -45,10 +45,13 @@ cp .env.example .env
 Edit `.env`:
  
 ```env
-GITHUB_TOKEN=ghp_yourtoken
+GITHUB_TOKEN_STREAMING=ghp_your_streaming_token
+GITHUB_TOKEN_BATCH=ghp_your_batch_token
 ```
  
 A GitHub personal access token is free — generate one at github.com/settings/tokens with no scopes required. It raises your API limit from 60 to 5,000 requests/hour.
+
+Optional: keep `GITHUB_TOKEN` as a shared fallback token if you do not want to set both variables.
  
 ### 3. Start Hadoop, Kafka, and HBase
 
@@ -113,6 +116,7 @@ create 'live_metrics', 'repo', 'metrics'
 create 'repos', 'info'
 create 'weekly_metrics', 'repo', 'stats'
 create 'ml_predictions', 'repo', 'ml'
+create 'batch_metadata', 'meta'
 ```
 
 List the tables to confirm:
@@ -128,6 +132,7 @@ You should see at least:
 - `repos`
 - `weekly_metrics`
 - `ml_predictions`
+- `batch_metadata`
 
 Exit HBase shell with:
 
