@@ -1,14 +1,16 @@
 import os
 import socket
 import time
+from html import escape
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
 import happybase
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
-st.set_page_config(page_title="GitHub Trends Analyzer", page_icon="data", layout="wide")
+st.set_page_config(page_title="GitHub Trends", page_icon="⚡", layout="wide")
 
 HBASE_HOST = os.getenv("HBASE_HOST", "hadoop-master")
 HBASE_PORT = int(os.getenv("HBASE_PORT", "9090"))
@@ -56,9 +58,6 @@ def scan_rows(
         conn = get_connection()
         try:
             table = conn.table(table_name)
-            # Some HBase/Thrift combinations return empty results when the "reverse"
-            # scan flag is provided. Use a forward scan for compatibility and sort
-            # by row key in memory when latest-first ordering is requested.
             rows = table.scan(row_prefix=prefix_bytes)
             result: List[Tuple[str, Dict[str, str]]] = []
             for row_key, cells in rows:
@@ -119,7 +118,6 @@ def get_live_events(limit: int = 30) -> pd.DataFrame:
 
 def get_weekly_metrics(limit: int = 200) -> pd.DataFrame:
     try:
-        # Read all rows first so helper snapshot rows do not consume the caller limit.
         rows = scan_rows("weekly_metrics", limit=0, latest_first=True)
     except Exception:
         return pd.DataFrame()
@@ -127,8 +125,6 @@ def get_weekly_metrics(limit: int = 200) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Ignore helper rows used for "last week" snapshots.
-    # Weekly analytics panels expect rows with the standard week#repo key.
     if "row_key" in df.columns:
         df = df[df["row_key"].astype(str).str.contains("#", regex=False)]
 
@@ -213,7 +209,6 @@ def activity_feed_df(limit: int = 20) -> pd.DataFrame:
 
 
 def language_stats_df() -> pd.DataFrame:
-    # Use full weekly dataset so all batch panels are consistent.
     df = get_weekly_metrics(limit=0)
     date_col = get_batch_day_column(df)
     required_cols = {"stats:stars", "stats:forks", "repo:language"}
@@ -235,12 +230,10 @@ def language_stats_df() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["language", "thisWeek", "lastWeek"])
 
-    # Normalize language labels so empty values are still visible in charts.
     df["_language"] = df["repo:language"].apply(
         lambda v: str(v).strip() if str(v).strip() else "Unknown"
     )
 
-    # Keep Unknown only when it is the only available language bucket.
     non_unknown_count = (df["_language"] != "Unknown").sum()
     if non_unknown_count > 0:
         df = df[df["_language"] != "Unknown"]
@@ -280,7 +273,6 @@ def language_stats_df() -> pd.DataFrame:
 
 
 def historical_df() -> pd.DataFrame:
-    # Use same complete dataset as language_stats_df for coherent charts.
     df = get_weekly_metrics(limit=0)
     date_col = get_batch_day_column(df)
     required_cols = {"stats:stars", "repo:language"}
@@ -305,7 +297,6 @@ def historical_df() -> pd.DataFrame:
         lambda v: str(v).strip() if str(v).strip() else "Unknown"
     )
 
-    # Keep Unknown only when no concrete language labels are available.
     non_unknown_count = (df["_language"] != "Unknown").sum()
     if non_unknown_count > 0:
         df = df[df["_language"] != "Unknown"]
@@ -349,7 +340,7 @@ def trending_daily_df(limit: int = 10) -> pd.DataFrame:
 
     df["_stars"] = df["stats:stars"].apply(_safe)
     df["_forks"] = df["stats:forks"].apply(_safe)
-    df["_score"] = df["stats:velocity"].apply(_safe) + df["stats:fork_velocity"].apply(_safe) 
+    df["_score"] = df["stats:velocity"].apply(_safe) + df["stats:fork_velocity"].apply(_safe)
     top = df.nlargest(limit, "_score")
     records = []
     for _, row in top.iterrows():
@@ -381,174 +372,602 @@ def ai_insights_df(limit: int = 10) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-def render_live_badge(streaming: bool = True) -> str:
-    if streaming:
-        return "LIVE"
-    return "BATCH"
+# ─── Design system ────────────────────────────────────────────────────────────
+
+LANG_COLORS = {
+    "Python":     "#3b82f6",
+    "TypeScript": "#a78bfa",
+    "JavaScript": "#fbbf24",
+    "Go":         "#34d399",
+    "Rust":       "#f97316",
+    "Java":       "#f43f5e",
+    "C++":        "#22d3ee",
+    "C":          "#94a3b8",
+    "Ruby":       "#fb7185",
+    "Swift":      "#ff6b6b",
+    "Kotlin":     "#c084fc",
+    "PHP":        "#818cf8",
+    "Unknown":    "#475569",
+}
+
+def lang_color(lang: str) -> str:
+    return LANG_COLORS.get(lang, "#64748b")
 
 
 CSS = """
 <style>
-    @import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap");
+@import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&family=Geist:wght@300;400;500;600;700;800;900&display=swap');
 
-    [data-testid="stAppViewContainer"] { background: #0d1117; color: #e6edf3; }
-    [data-testid="stHeader"] { background: #0d1117; border-bottom: 1px solid #21262d; }
-    [data-testid="stMainBlockContainer"] { padding-top: 1rem; }
+*, *::before, *::after { box-sizing: border-box; }
 
-    .panel-stream {
-        background: #161b22;
-        border: 2px solid #238636;
-        border-radius: 8px;
-        padding: 1rem;
-        position: relative;
-        box-shadow: 0 0 12px rgba(35, 134, 54, 0.15);
-    }
-    .panel-stream::before {
-        content: "";
-        position: absolute;
-        top: 0; left: 0; right: 0;
-        height: 2px;
-        background: linear-gradient(90deg, transparent, #238636, transparent);
-        animation: pulse-bar 2s ease-in-out infinite;
-    }
-    .panel-batch {
-        background: #161b22;
-        border: 1px solid #8957e5;
-        border-radius: 8px;
-        padding: 1rem;
-    }
-    .panel-live-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 0.7rem;
-        font-weight: 600;
-        font-family: "JetBrains Mono", monospace;
-        background: rgba(35, 134, 54, 0.15);
-        color: #238636;
-        padding: 2px 10px;
-        border-radius: 20px;
-        border: 1px solid rgba(35, 134, 54, 0.3);
-    }
-    .panel-live-badge::before {
-        content: "";
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: #238636;
-        animation: pulse-dot 1.5s ease-in-out infinite;
-    }
-    .panel-batch-badge {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 0.7rem;
-        font-weight: 600;
-        font-family: "JetBrains Mono", monospace;
-        background: rgba(137, 87, 229, 0.15);
-        color: #8957e5;
-        padding: 2px 10px;
-        border-radius: 20px;
-        border: 1px solid rgba(137, 87, 229, 0.3);
-    }
-    .panel-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 0.75rem;
-    }
-    .panel-title {
-        font-size: 1rem;
-        font-weight: 700;
-        color: #e6edf3;
-        font-family: "Inter", sans-serif;
-    }
-    .panel-desc {
-        font-size: 0.7rem;
-        color: #7d8590;
-        margin-bottom: 0.75rem;
-    }
-    .feed-row {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        padding: 6px 8px;
-        border-radius: 6px;
-        font-family: "JetBrains Mono", monospace;
-        font-size: 0.72rem;
-        color: #e6edf3;
-        transition: background 0.15s;
-    }
-    .feed-row:hover { background: rgba(110, 118, 129, 0.12); }
-    .feed-container {
-        max-height: 340px;
-        overflow-y: auto;
-        scrollbar-width: thin;
-        scrollbar-color: #30363d #0d1117;
-    }
-    .feed-container::-webkit-scrollbar { width: 4px; }
-    .feed-container::-webkit-scrollbar-track { background: #0d1117; }
-    .feed-container::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
-    .feed-row .ts { color: #7d8590; width: 70px; flex-shrink: 0; }
-    .feed-row .ev { width: 100px; flex-shrink: 0; color: #79c0ff; }
-    .feed-row .rp { flex: 1; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tr-row {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        padding: 8px 12px;
-        border-radius: 6px;
-        font-size: 0.82rem;
-        transition: all 0.2s;
-    }
-    .tr-row:hover { background: rgba(110, 118, 129, 0.1); }
-    .tr-row.flash-row { animation: flash-green 1.2s ease-out; }
-    @keyframes flash-green {
-        0%   { background: rgba(35, 134, 54, 0.4); }
-        100% { background: transparent; }
-    }
-    .tr-rank { color: #7d8590; font-family: "JetBrains Mono", monospace; width: 20px; text-align: right; }
-    .tr-name { flex: 1; font-weight: 500; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tr-lang { font-size: 0.7rem; color: #7d8590; background: rgba(110, 118, 129, 0.15); padding: 2px 8px; border-radius: 6px; }
-    .tr-stars { font-family: "JetBrains Mono", monospace; color: #238636; font-size: 0.82rem; }
-    .tr-container { max-height: 340px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #30363d #161b22; }
-    .tr-container::-webkit-scrollbar { width: 4px; }
-    .tr-container::-webkit-scrollbar-track { background: #161b22; }
-    .tr-container::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
-    .insight-row {
-        display: flex;
-        align-items: center;
-        gap: 1rem;
-        padding: 10px 14px;
-        border-radius: 8px;
-        background: rgba(110, 118, 129, 0.08);
-    }
-    .insight-row .repo { flex: 1; min-width: 0; }
-    .insight-row .repo-name { font-weight: 600; font-size: 0.85rem; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .insight-row .cluster { font-size: 0.72rem; color: #7d8590; }
-    .insight-row .prob { font-weight: 700; font-size: 0.9rem; color: #238636; }
-    .insight-row .stars-next { font-size: 0.72rem; color: #7d8590; }
-    .site-header {
-        border-bottom: 1px solid #21262d;
-        padding: 0.75rem 1.5rem;
-        background: #0d1117;
-    }
-    .site-title { font-size: 1.2rem; font-weight: 800; color: #e6edf3; }
-    .site-subtitle { font-size: 0.7rem; color: #7d8590; margin-top: 2px; }
-    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; }
-    .status-dot-live { background: #238636; animation: pulse-dot 1.5s ease-in-out infinite; }
-    .status-dot-batch { background: #8957e5; }
-    @keyframes pulse-dot {
-        0%, 100% { opacity: 1; }
-        50% { opacity: 0.3; }
-    }
-    @keyframes pulse-bar {
-        0% { opacity: 0.3; }
-        50% { opacity: 1; }
-        100% { opacity: 0.3; }
-    }
-    [data-testid="stHorizontalBlock"] > div { gap: 1rem; }
-    .stHorizontalBlock [data-testid="stVerticalBlock"] { padding: 0 !important; }
+/* ── App chrome ── */
+[data-testid="stAppViewContainer"] {
+    background: #050810;
+    color: #e2e8f0;
+    font-family: 'Geist', sans-serif;
+}
+[data-testid="stHeader"] { background: transparent; border: none; }
+[data-testid="stMainBlockContainer"] { padding-top: 0 !important; }
+[data-testid="stSidebar"] {
+    background: #080d1a !important;
+    border-right: 1px solid rgba(99, 102, 241, 0.12) !important;
+}
+[data-testid="stSidebar"] * { color: #94a3b8 !important; font-family: 'Geist Mono', monospace !important; font-size: 0.7rem !important; }
+[data-testid="stSidebar"] .stSelectbox label { color: #64748b !important; font-size: 0.65rem !important; text-transform: uppercase; letter-spacing: 0.1em; }
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 99px; }
+* { scrollbar-width: thin; scrollbar-color: rgba(99,102,241,0.3) transparent; }
+
+/* ── Animations ── */
+@keyframes pulse-live {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(16,185,129,0.5); opacity: 1; }
+    50% { box-shadow: 0 0 0 4px rgba(16,185,129,0); opacity: 0.6; }
+}
+@keyframes scan-line {
+    0% { transform: translateY(-100%); opacity: 0; }
+    10% { opacity: 1; }
+    90% { opacity: 1; }
+    100% { transform: translateY(500%); opacity: 0; }
+}
+@keyframes shimmer {
+    0% { background-position: -200% center; }
+    100% { background-position: 200% center; }
+}
+@keyframes fade-up {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes row-flash {
+    0%   { background: rgba(16,185,129,0.18); }
+    100% { background: transparent; }
+}
+@keyframes border-flow {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+}
+
+/* ── Site header ── */
+.gh-header {
+    padding: 1.1rem 1.75rem 1rem;
+    border-bottom: 1px solid rgba(99,102,241,0.1);
+    background: linear-gradient(180deg, rgba(99,102,241,0.04) 0%, transparent 100%);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+}
+.gh-header-left {}
+.gh-wordmark {
+    font-family: 'Geist', sans-serif;
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: -0.04em;
+    color: #f1f5f9;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.gh-wordmark-icon {
+    width: 26px;
+    height: 26px;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85rem;
+}
+.gh-subtitle {
+    font-size: 0.68rem;
+    color: #475569;
+    font-family: 'Geist Mono', monospace;
+    margin-top: 3px;
+    letter-spacing: 0.04em;
+}
+.gh-header-right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.gh-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 5px 12px;
+    border-radius: 99px;
+    text-transform: uppercase;
+}
+.gh-status-pill.live {
+    background: rgba(16,185,129,0.08);
+    border: 1px solid rgba(16,185,129,0.25);
+    color: #10b981;
+}
+.gh-status-pill.batch {
+    background: rgba(99,102,241,0.08);
+    border: 1px solid rgba(99,102,241,0.25);
+    color: #818cf8;
+}
+.gh-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.gh-status-dot.live {
+    background: #10b981;
+    animation: pulse-live 2s ease-in-out infinite;
+}
+.gh-status-dot.batch {
+    background: #818cf8;
+}
+
+/* ── Panel base ── */
+.panel {
+    border-radius: 12px;
+    padding: 1.1rem 1.15rem 1rem;
+    position: relative;
+    overflow: hidden;
+    animation: fade-up 0.35s ease both;
+    height: 100%;
+    min-height: 440px;
+}
+.panel-live {
+    background: linear-gradient(145deg, #040b14 0%, #060d18 100%);
+    border: 1px solid rgba(16,185,129,0.2);
+    box-shadow: 0 0 0 1px rgba(16,185,129,0.04) inset, 0 20px 40px rgba(0,0,0,0.4);
+}
+.panel-live::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, #10b981 40%, #34d399 60%, transparent 100%);
+    animation: border-flow 3s ease-in-out infinite;
+}
+.panel-live::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 2px;
+    background: linear-gradient(90deg, transparent, rgba(16,185,129,0.6), transparent);
+    animation: scan-line 6s ease-in-out infinite;
+    pointer-events: none;
+}
+.panel-batch {
+    background: linear-gradient(145deg, #06060f 0%, #08081a 100%);
+    border: 1px solid rgba(99,102,241,0.18);
+    box-shadow: 0 0 0 1px rgba(99,102,241,0.04) inset, 0 20px 40px rgba(0,0,0,0.4);
+}
+.panel-batch::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent 0%, #6366f1 50%, transparent 100%);
+    opacity: 0.6;
+}
+
+/* ── Panel header ── */
+.panel-hd {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+}
+.panel-title {
+    font-size: 0.88rem;
+    font-weight: 700;
+    color: #f1f5f9;
+    letter-spacing: -0.02em;
+    margin: 0;
+    font-family: 'Geist', sans-serif;
+}
+.panel-desc {
+    font-size: 0.62rem;
+    color: #334155;
+    font-family: 'Geist Mono', monospace;
+    letter-spacing: 0.02em;
+    margin-bottom: 0.9rem;
+}
+.badge-live {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: #10b981;
+    background: rgba(16,185,129,0.08);
+    border: 1px solid rgba(16,185,129,0.2);
+    padding: 3px 9px;
+    border-radius: 99px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.badge-live-dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: #10b981;
+    animation: pulse-live 1.8s ease-in-out infinite;
+    flex-shrink: 0;
+}
+.badge-batch {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: #818cf8;
+    background: rgba(99,102,241,0.08);
+    border: 1px solid rgba(99,102,241,0.2);
+    padding: 3px 9px;
+    border-radius: 99px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+.badge-ml {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.6rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: #c084fc;
+    background: rgba(192,132,252,0.08);
+    border: 1px solid rgba(192,132,252,0.2);
+    padding: 3px 9px;
+    border-radius: 99px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* ── Scroll containers ── */
+.scroll-box {
+    max-height: 340px;
+    overflow-y: auto;
+    padding-right: 2px;
+}
+
+/* ── Empty state ── */
+.empty-state {
+    padding: 2rem 1rem;
+    text-align: center;
+    color: #334155;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.72rem;
+}
+.empty-state-icon { font-size: 1.5rem; margin-bottom: 0.5rem; opacity: 0.4; }
+
+/* ── Trending repos list ── */
+.repo-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 7px 8px;
+    border-radius: 8px;
+    transition: background 0.15s;
+    cursor: default;
+}
+.repo-row:hover { background: rgba(255,255,255,0.03); }
+.repo-rank {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.62rem;
+    color: #1e293b;
+    width: 18px;
+    text-align: right;
+    flex-shrink: 0;
+    font-weight: 600;
+}
+.repo-name {
+    flex: 1;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #e2e8f0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: 'Geist', sans-serif;
+}
+.repo-lang-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+.repo-lang-label {
+    font-size: 0.62rem;
+    color: #475569;
+    font-family: 'Geist Mono', monospace;
+    width: 72px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.repo-stars {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: #10b981;
+    flex-shrink: 0;
+}
+.repo-row-new { animation: row-flash 1.4s ease-out; }
+
+/* ── Activity feed ── */
+.feed-row {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    padding: 5px 8px;
+    border-radius: 6px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.66rem;
+    color: #e2e8f0;
+    transition: background 0.12s;
+}
+.feed-row:hover { background: rgba(255,255,255,0.025); }
+.feed-ts { color: #1e293b; width: 62px; flex-shrink: 0; font-weight: 500; }
+.feed-type-watch {
+    color: #fbbf24;
+    background: rgba(251,191,36,0.07);
+    border: 1px solid rgba(251,191,36,0.12);
+    padding: 1px 7px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    width: 88px;
+    text-align: center;
+}
+.feed-type-fork {
+    color: #818cf8;
+    background: rgba(129,140,248,0.07);
+    border: 1px solid rgba(129,140,248,0.12);
+    padding: 1px 7px;
+    border-radius: 4px;
+    flex-shrink: 0;
+    width: 88px;
+    text-align: center;
+}
+.feed-repo {
+    flex: 1;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Rising languages bars ── */
+.lang-bar-row {
+    display: grid;
+    grid-template-columns: 78px 1fr;
+    align-items: center;
+    gap: 0.65rem;
+    margin-bottom: 0.5rem;
+}
+.lang-bar-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.7rem;
+    color: #94a3b8;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.lang-bar-track {
+    position: relative;
+    height: 24px;
+}
+.lang-bar-bg {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 8px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 4px;
+}
+.lang-bar-last {
+    position: absolute;
+    top: 0; left: 0;
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(148, 163, 184, 0.5);
+    min-width: 3px;
+    transition: width 0.6s cubic-bezier(.4,0,.2,1);
+}
+.lang-bar-this {
+    position: absolute;
+    top: 12px; left: 0;
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(34, 211, 238, 0.8);
+    min-width: 3px;
+    transition: width 0.6s cubic-bezier(.4,0,.2,1);
+}
+.lang-bar-tooltip {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    min-width: 160px;
+    background: #0d1117;
+    border: 1px solid rgba(99,102,241,0.2);
+    border-radius: 8px;
+    padding: 8px 12px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.5);
+    display: none;
+    z-index: 30;
+    pointer-events: none;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.72rem;
+}
+.lang-bar-track:hover .lang-bar-tooltip { display: block; }
+.lang-bar-tooltip .ttlang { color: #f1f5f9; font-weight: 700; margin-bottom: 6px; font-size: 0.8rem; }
+.lang-bar-tooltip .ttlast { color: #6366f1; margin-bottom: 2px; }
+.lang-bar-tooltip .ttthis { color: #10b981; }
+.lang-legend {
+    display: flex;
+    gap: 1.2rem;
+    margin-top: 0.6rem;
+    padding-left: 78px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.62rem;
+    color: #475569;
+}
+.lang-legend-item { display: flex; align-items: center; gap: 5px; }
+.lang-legend-swatch { width: 14px; height: 6px; border-radius: 2px; }
+
+/* ── Trending daily ── */
+.daily-row {
+    padding: 6px 8px 10px;
+    margin-bottom: 2px;
+}
+.daily-row-top {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 5px;
+}
+.daily-rank {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.62rem;
+    color: #1e293b;
+    width: 18px;
+    text-align: right;
+    flex-shrink: 0;
+    font-weight: 600;
+}
+.daily-name {
+    flex: 1;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: #e2e8f0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.daily-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.63rem;
+}
+.daily-stars { color: #10b981; }
+.daily-forks { color: #818cf8; }
+.daily-bar {
+    height: 2px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 1px;
+    overflow: hidden;
+    margin-left: 26px;
+}
+.daily-bar-fill {
+    height: 100%;
+    border-radius: 1px;
+    background: linear-gradient(90deg, #6366f1, #8b5cf6, #a78bfa);
+    transition: width 0.5s ease;
+}
+
+/* ── AI insights ── */
+.insight-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 10px 10px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.03);
+    transition: border-color 0.15s, background 0.15s;
+    margin-bottom: 6px;
+}
+.insight-row:hover {
+    background: rgba(255,255,255,0.035);
+    border-color: rgba(192,132,252,0.12);
+}
+.insight-name {
+    flex: 1;
+    font-weight: 600;
+    font-size: 0.78rem;
+    color: #e2e8f0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: 'Geist', sans-serif;
+}
+.insight-cluster {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.6rem;
+    color: #475569;
+    width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.insight-prob-bar {
+    width: 60px;
+    height: 4px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.insight-prob-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, #10b981, #34d399);
+}
+.insight-prob-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: #10b981;
+    width: 36px;
+    text-align: right;
+}
+.insight-stars {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.62rem;
+    color: #334155;
+    width: 58px;
+    text-align: right;
+}
+
+/* ── Divider ── */
+.section-gap { height: 1rem; }
+
+/* ── Disable Streamlit rerun overlay ── */
+[data-stale="true"] { opacity: 1 !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 </style>
 """
 
@@ -557,21 +976,22 @@ def render_header():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown(
         """
-        <div class="site-header">
-            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:0.5rem;">
-                <div>
-                    <div class="site-title">GitHub Trends Analyzer</div>
-                    <div class="site-subtitle">Real-time streaming + daily batch pipeline dashboard</div>
-                </div>
-                <div style="display:flex;align-items:center;gap:1.5rem;">
-                    <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
-                        Stream: <span class="status-dot status-dot-live"></span> LIVE
-                    </span>
-                    <span style="display:flex;align-items:center;gap:6px;font-size:0.72rem;font-weight:600;color:#e6edf3;">
-                        Batch: <span class="status-dot status-dot-batch"></span> Last run daily
-                    </span>
-                </div>
+        <div class="gh-header">
+          <div class="gh-header-left">
+            <div class="gh-wordmark">
+              <span class="gh-wordmark-icon">⚡</span>
+              GitHub Trends
             </div>
+            <div class="gh-subtitle">real-time kafka stream · daily pyspark batch · hbase storage</div>
+          </div>
+          <div class="gh-header-right">
+            <span class="gh-status-pill live">
+              <span class="gh-status-dot live"></span>Stream live
+            </span>
+            <span class="gh-status-pill batch">
+              <span class="gh-status-dot batch"></span>Batch daily
+            </span>
+          </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -584,247 +1004,299 @@ def render_trending_now(df: pd.DataFrame):
     new_repos: set = curr - prev
     st.session_state["prev_trending"] = list(curr)
 
-    rows_html = ""
     if df.empty:
-        rows_html = '<div style="padding:8px 12px;color:#7d8590;font-size:0.82rem;">No live metrics yet — waiting for stream...</div>'
+        body = '<div class="empty-state"><div class="empty-state-icon">📡</div>Waiting for stream data…</div>'
     else:
+        rows = ""
         for i, row in df.iterrows():
-            rank = i + 1
             name = row.get("repo", "")
             lang = row.get("language", "Unknown")
             stars = row.get("stars", 0)
-            is_new = name in new_repos
-            flash = "animation:flash-green 1.2s ease-out;" if is_new else ""
-            rows_html += f"""
-            <div style="{flash}display:flex;align-items:center;gap:0.75rem;padding:8px 12px;border-radius:6px;transition:all 0.2s;font-size:0.82rem;">
-                <span style="color:#7d8590;font-family:monospace;width:20px;text-align:right;">{rank}</span>
-                <span style="flex:1;font-weight:500;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{name}</span>
-                <span style="font-size:0.7rem;color:#7d8590;background:rgba(110,118,129,0.15);padding:2px 8px;border-radius:6px;">{lang}</span>
-                <span style="font-family:monospace;color:#238636;">&#11088; {stars}</span>
+            color = lang_color(lang)
+            flash = " repo-row-new" if name in new_repos else ""
+            rows += f"""
+            <div class="repo-row{flash}">
+                <span class="repo-rank">{i+1}</span>
+                <span class="repo-name">{escape(name)}</span>
+                <span class="repo-lang-dot" style="background:{color};"></span>
+                <span class="repo-lang-label">{escape(lang)}</span>
+                <span class="repo-stars">★ {stars:,}</span>
             </div>"""
+        body = f'<div class="scroll-box">{rows}</div>'
 
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #238636;border-radius:8px;padding:1rem;position:relative;box-shadow:0 0 12px rgba(35,134,54,0.15);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Now</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(35,134,54,0.15);color:#238636;padding:2px 10px;border-radius:20px;border:1px solid rgba(35,134,54,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#238636;animation:pulse-dot 1.5s ease-in-out infinite;"></span>
-                LIVE
-            </span>
+    st.html(f"""
+    <div class="panel panel-live">
+        <div class="panel-hd">
+            <h3 class="panel-title">Trending Now</h3>
+            <span class="badge-live"><span class="badge-live-dot"></span>LIVE</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by star count in last window</div>
-        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;">
-            {rows_html}
-        </div>
-    </div>"""
-    st.html(panel_html)
+        <div class="panel-desc">TOP REPOS BY STAR COUNT · CURRENT WINDOW</div>
+        {body}
+    </div>""")
 
 
 def render_activity_feed(df: pd.DataFrame):
-    rows_html = ""
     if df.empty:
-        rows_html = '<div style="padding:8px 12px;color:#7d8590;font-size:0.72rem;">No events yet — waiting for stream...</div>'
+        body = '<div class="empty-state"><div class="empty-state-icon">📡</div>No events yet — waiting for stream…</div>'
     else:
+        rows = ""
         for _, row in df.iterrows():
-            ts = row.get("timestamp", "")
+            ts = escape(row.get("timestamp", ""))
             ev = row.get("type", "Event")
-            rp = row.get("repo", "")
-            display_ev = "&#11088; WatchEvent" if ev == "WatchEvent" else "&#127794; ForkEvent"
-            rows_html += f"""
-            <div style="display:flex;align-items:center;gap:0.75rem;padding:6px 8px;border-radius:6px;font-family:monospace;font-size:0.72rem;color:#e6edf3;transition:background 0.15s;">
-                <span style="color:#7d8590;width:70px;flex-shrink:0;">{ts}</span>
-                <span style="width:100px;flex-shrink:0;color:#79c0ff;">{display_ev}</span>
-                <span style="flex:1;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{rp}</span>
+            rp = escape(row.get("repo", ""))
+            if ev == "WatchEvent":
+                type_html = f'<span class="feed-type-watch">★ Watch</span>'
+            else:
+                type_html = f'<span class="feed-type-fork">⑂ Fork</span>'
+            rows += f"""
+            <div class="feed-row">
+                <span class="feed-ts">{ts}</span>
+                {type_html}
+                <span class="feed-repo">{rp}</span>
             </div>"""
+        body = f'<div class="scroll-box">{rows}</div>'
 
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #238636;border-radius:8px;padding:1rem;position:relative;box-shadow:0 0 12px rgba(35,134,54,0.15);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Live Activity Feed</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(35,134,54,0.15);color:#238636;padding:2px 10px;border-radius:20px;border:1px solid rgba(35,134,54,0.3);">
-                <span style="width:6px;height:6px;border-radius:50%;background:#238636;animation:pulse-dot 1.5s ease-in-out infinite;"></span>
-                LIVE
-            </span>
+    st.html(f"""
+    <div class="panel panel-live">
+        <div class="panel-hd">
+            <h3 class="panel-title">Live Activity Feed</h3>
+            <span class="badge-live"><span class="badge-live-dot"></span>LIVE</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Raw Kafka events — as they arrive</div>
-        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;">
-            {rows_html}
-        </div>
-    </div>"""
-    st.html(panel_html)
+        <div class="panel-desc">RAW KAFKA EVENTS · AS THEY ARRIVE</div>
+        {body}
+    </div>""")
 
 
 def render_rising_languages(df: pd.DataFrame):
-    if df.empty:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+    if df.empty or (
+        len(df) > 0 and set(df["language"].astype(str).str.strip().tolist()) == {"Unknown"}
+    ):
+        msg = "No daily batch data yet." if df.empty else "Language enrichment in progress…"
+        body = f'<div class="empty-state"><div class="empty-state-icon">📊</div>{msg}</div>'
+        st.html(f"""
+        <div class="panel panel-batch">
+            <div class="panel-hd">
+                <h3 class="panel-title">Rising Languages</h3>
+                <span class="badge-batch">BATCH</span>
             </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No daily batch data yet — run the batch job first.</div>
-        </div>"""
-        st.html(panel_html)
+            <div class="panel-desc">DAILY STAR COUNTS BY LANGUAGE</div>
+            {body}
+        </div>""")
         return
 
-    # When enrichment has not resolved languages yet, avoid rendering a misleading chart.
-    if set(df["language"].astype(str).str.strip().tolist()) == {"Unknown"}:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+    chart_df = df.head(10).copy()
+    chart_df["thisWeek"] = pd.to_numeric(chart_df["thisWeek"], errors="coerce").fillna(0)
+    chart_df["lastWeek"] = pd.to_numeric(chart_df["lastWeek"], errors="coerce").fillna(0)
+    max_val = max(int(chart_df[["thisWeek","lastWeek"]].values.max()), 1)
+
+    rows = ""
+    for _, row in chart_df.iterrows():
+        lang = str(row.get("language", "Unknown"))
+        tw = max(int(row.get("thisWeek", 0)), 0)
+        lw = max(int(row.get("lastWeek", 0)), 0)
+        tw_pct = max((tw / max_val) * 100, 1.5)
+        lw_pct = max((lw / max_val) * 100, 1.5)
+        rows += f"""
+        <div class="lang-bar-row">
+            <div class="lang-bar-label">{escape(lang)}</div>
+            <div class="lang-bar-track">
+                <div class="lang-bar-bg"></div>
+                <div class="lang-bar-last" style="width:{lw_pct:.2f}%;"></div>
+                <div class="lang-bar-this" style="width:{tw_pct:.2f}%;"></div>
+                <div class="lang-bar-tooltip">
+                    <div class="ttlang">{escape(lang)}</div>
+                    <div class="ttlast">Yesterday: {lw:,}</div>
+                    <div class="ttthis">Today: {tw:,}</div>
+                </div>
             </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Language enrichment is still in progress. Daily stars are available, but language labels are not resolved yet.</div>
         </div>"""
-        st.html(panel_html)
-        return
 
-    chart_df = df.head(8).copy().set_index("language")[["thisWeek", "lastWeek"]]
-
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Rising Languages</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+    st.html(f"""
+    <div class="panel panel-batch">
+        <div class="panel-hd">
+            <h3 class="panel-title">Rising Languages</h3>
+            <span class="badge-batch">BATCH</span>
         </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Stars per language for latest day (vs previous day)</div>
-    </div>"""
-    st.html(panel_html)
-    st.bar_chart(chart_df, use_container_width=True)
+        <div class="panel-desc">DAILY STAR ACTIVITY BY LANGUAGE · HOVER FOR DETAILS</div>
+        {rows}
+        <div class="lang-legend">
+            <span class="lang-legend-item"><span class="lang-legend-swatch" style="background:rgba(148, 163, 184, 0.5);"></span>Yesterday</span>
+            <span class="lang-legend-item"><span class="lang-legend-swatch" style="background:rgba(34, 211, 238, 0.8);"></span>Today</span>
+        </div>
+    </div>""")
 
 
 def render_historical_trends(df: pd.DataFrame):
-    if df.empty or len(df.columns) <= 1:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
-            </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No historical data yet — run the batch job first.</div>
-        </div>"""
-        st.html(panel_html)
-        return
+    EMPTY_HIST = "LANGUAGE STARS OVER TIME · DAILY PYSPARK BATCHES"
+    FULL_HIST  = "LANGUAGE STARS OVER TIME · GROUPED BY DAY · REFRESHED DAILY"
 
-    only_unknown = len(df.columns) == 2 and "Unknown" in df.columns
-    if only_unknown:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
-            </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — computed by PySpark from GH Archive</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">Historical stars are available, but language labels are unresolved (Unknown only). Run one more batch after enrichment to see per-language history.</div>
-        </div>"""
-        st.html(panel_html)
-        return
+    # Target the named container directly - reliable across Streamlit versions
+    st.markdown("""
+    <style>
+    .st-key-hist_box {
+        background: linear-gradient(145deg,#06060f,#08081a) !important;
+        border: 1px solid rgba(99,102,241,0.18) !important;
+        border-radius: 12px !important;
+        margin-top: -0.85rem !important;
+        padding: 1.5rem 1.6rem !important;
+        box-shadow: 0 0 0 1px rgba(99,102,241,0.04) inset, 0 20px 40px rgba(0,0,0,0.4) !important;
+    }
+    .st-key-hist_box [data-testid="stPlotlyChart"] {
+        margin-top: 1rem;
+        padding: 0.5rem 0;
+    }
+    </style>""", unsafe_allow_html=True)
 
-    languages = [c for c in df.columns if c != "day"]
-    chart_df = df.copy().set_index("day")[languages]
-
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Historical Trends</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
+    def render_header(desc: str) -> None:
+        st.html(f"""
+        <div class="panel-hd">
+            <h3 class="panel-title">Historical Trends</h3>
+            <span class="badge-batch">BATCH</span>
         </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Language stars over time — grouped by day from daily batches</div>
-    </div>"""
-    st.html(panel_html)
-    st.line_chart(chart_df, use_container_width=True)
+        <div class="panel-desc">{desc}</div>""")
+
+    with st.container(key="hist_box"):
+        if df.empty or len(df.columns) <= 1:
+            render_header(EMPTY_HIST)
+            st.html('<div class="empty-state"><div class="empty-state-icon">📈</div>No historical data yet — run the batch job first.</div>')
+            return
+
+        if len(df.columns) == 2 and "Unknown" in df.columns:
+            render_header(EMPTY_HIST)
+            st.html('<div class="empty-state"><div class="empty-state-icon">🏷️</div>Language labels unresolved. Run another batch after enrichment.</div>')
+            return
+
+        render_header(FULL_HIST)
+
+        chart_df = df.copy()
+        # String dates → category axis → exactly one tick per day, no duplicates
+        chart_df["day"] = pd.to_datetime(chart_df["day"], errors="coerce").dt.strftime("%d %b")
+        chart_df = chart_df.dropna(subset=["day"]).sort_values("day")
+        languages = [c for c in chart_df.columns if c != "day"]
+
+        palette = ["#10b981", "#818cf8", "#fbbf24", "#f43f5e", "#22d3ee", "#c084fc", "#34d399"]
+
+        fig = go.Figure()
+        for i, lang in enumerate(languages):
+            color = palette[i % len(palette)]
+            series = pd.to_numeric(chart_df[lang], errors="coerce").fillna(0)
+            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+            fig.add_trace(go.Scatter(
+                x=chart_df["day"], y=series,
+                name=lang,
+                mode="lines",
+                line={"color": color, "width": 2.5, "shape": "spline", "smoothing": 0.6},
+                fill="tozeroy",
+                fillcolor=f"rgba({r},{g},{b},0.04)",
+                hovertemplate=f"<b>{lang}</b>: %{{y:,.0f}}<extra></extra>",
+            ))
+
+        fig.update_layout(
+            height=310,
+            margin={"l": 70, "r": 70, "t": 16, "b": 50},
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            hovermode="x unified",
+            hoverlabel={"bgcolor": "#0d1117", "bordercolor": "#1e293b",
+                        "font": {"color": "#e2e8f0", "size": 12, "family": "Geist Mono"}},
+            legend={"orientation": "h", "yanchor": "top", "y": -0.08,
+                    "xanchor": "center", "x": 0.5,
+                    "font": {"color": "#64748b", "size": 11, "family": "Geist Mono"},
+                    "bgcolor": "rgba(0,0,0,0)"},
+            xaxis={"type": "category"},
+        )
+        fig.update_xaxes(
+            showgrid=False,
+            tickfont={"color": "#475569", "size": 10, "family": "Geist Mono"},
+            showline=False, zeroline=False,
+            tickmode="auto", nticks=8,
+        )
+        fig.update_yaxes(
+            showgrid=True, gridcolor="rgba(255,255,255,0.03)", gridwidth=1,
+            tickfont={"color": "#475569", "size": 10, "family": "Geist Mono"},
+            showline=False, zeroline=False, tickformat=",.0f",
+        )
+
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 def render_trending_daily(df: pd.DataFrame):
     if df.empty:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Yesterday</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
-            </div>
-            <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks for latest daily batch</div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No daily batch data yet — run the batch job first.</div>
-        </div>"""
-        st.html(panel_html)
-        return
+        body = '<div class="empty-state"><div class="empty-state-icon">📦</div>No daily batch data yet — run the batch job first.</div>'
+    else:
+        max_score = max(df["score"].max(), 1)
+        rows = ""
+        for i, row in df.iterrows():
+            name = escape(row.get("repo", ""))
+            lang = row.get("language", "Unknown")
+            stars = row.get("stars", 0)
+            forks = row.get("forks", 0)
+            score = row.get("score", 0)
+            pct = max(int(score) / max_score * 100, 2)
+            color = lang_color(lang)
+            rows += f"""
+            <div class="daily-row">
+                <div class="daily-row-top">
+                    <span class="daily-rank">{i+1}</span>
+                    <span class="daily-name">{name}</span>
+                    <span class="daily-meta">
+                        <span class="daily-stars">★ {int(stars):,}</span>
+                        <span style="color:#1e293b;">·</span>
+                        <span class="daily-forks">⑂ {int(forks):,}</span>
+                        <span style="width:6px;height:6px;border-radius:50%;background:{color};margin-left:4px;display:inline-block;"></span>
+                    </span>
+                </div>
+                <div class="daily-bar">
+                    <div class="daily-bar-fill" style="width:{pct:.1f}%;"></div>
+                </div>
+            </div>"""
+        body = f'<div class="scroll-box">{rows}</div>'
 
-    rows_html = ""
-    for i, row in df.iterrows():
-        rank = i + 1
-        name = row.get("repo", "")
-        lang = row.get("language", "Unknown")
-        score = row.get("score", 0)
-        stars = row.get("stars", 0)
-        forks = row.get("forks", 0)
-        pct = max(int(score) / max(df["score"].max(), 1) * 100, 2)
-        rows_html += f"""
-        <div style="display:flex;align-items:center;gap:0.75rem;padding:8px 12px;border-radius:6px;transition:all 0.2s;font-size:0.82rem;">
-            <span style="color:#7d8590;font-family:monospace;width:20px;text-align:right;">{rank}</span>
-            <span style="flex:1;font-weight:500;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{name}</span>
-            <span style="font-size:0.7rem;color:#7d8590;background:rgba(110,118,129,0.15);padding:2px 8px;border-radius:6px;">{lang}</span>
-            <span style="font-family:monospace;color:#8957e5;width:60px;text-align:right;">&#11088;{int(stars):,} &#127794;{int(forks):,}</span>
+    st.html(f"""
+    <div class="panel panel-batch">
+        <div class="panel-hd">
+            <h3 class="panel-title">Trending Yesterday</h3>
+            <span class="badge-batch">BATCH</span>
         </div>
-        <div style="height:3px;background:#21262d;border-radius:2px;overflow:hidden;">
-            <div style="width:{pct:.1f}%;height:100%;background:linear-gradient(90deg,#8957e5,#bc8cff);border-radius:2px;"></div>
-        </div>"""
-
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">Trending Yesterday</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH</span>
-        </div>
-        <div style="font-size:0.7rem;color:#7d8590;margin-bottom:0.75rem;">Top repos by stars + forks for latest daily batch</div>
-        <div style="max-height:340px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;display:flex;flex-direction:column;gap:4px;">
-            {rows_html}
-        </div>
-    </div>"""
-    st.html(panel_html)
+        <div class="panel-desc">TOP REPOS BY VELOCITY SCORE · LATEST DAILY BATCH</div>
+        {body}
+    </div>""")
 
 
 def render_ai_insights(df: pd.DataFrame):
     if df.empty:
-        panel_html = """
-        <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-                <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">AI Insights</h3>
-                <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH + ML</span>
-            </div>
-            <div style="padding:16px 12px;color:#7d8590;font-size:0.82rem;">No ML predictions yet — run the batch job first.</div>
-        </div>"""
-        st.html(panel_html)
-        return
+        body = '<div class="empty-state"><div class="empty-state-icon">🤖</div>No ML predictions yet — run the batch job first.</div>'
+    else:
+        rows = ""
+        for _, row in df.iterrows():
+            repo = escape(row.get("repo", ""))
+            prob = row.get("probability", 0)
+            prob_pct = int(prob * 100)
+            cluster = escape(str(row.get("cluster", "")))
+            stars = int(row.get("predictedStars", 0))
+            rows += f"""
+            <div class="insight-row">
+                <span class="insight-name">{repo}</span>
+                <span class="insight-cluster">{cluster}</span>
+                <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
+                    <div class="insight-prob-bar">
+                        <div class="insight-prob-fill" style="width:{prob_pct}%;"></div>
+                    </div>
+                    <span class="insight-prob-label">{prob_pct}%</span>
+                </div>
+                <span class="insight-stars">+{stars:,} ★</span>
+            </div>"""
+        body = rows
 
-    rows_html = ""
-    for _, row in df.iterrows():
-        repo = row.get("repo", "")
-        prob = int(row.get("probability", 0) * 100)
-        cluster = row.get("cluster", "")
-        stars = row.get("predictedStars", 0)
-        rows_html += f"""
-        <div style="display:flex;align-items:center;gap:1rem;padding:10px 14px;border-radius:8px;background:rgba(110,118,129,0.08);">
-            <span style="flex:1;font-weight:600;font-size:0.85rem;color:#e6edf3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{repo}</span>
-            <span style="font-size:0.72rem;color:#7d8590;width:120px;">{cluster}</span>
-            <span style="font-weight:700;font-size:0.9rem;color:#238636;width:50px;text-align:right;">{prob}%</span>
-            <span style="font-size:0.72rem;color:#7d8590;width:60px;text-align:right;">+{int(stars):,} &#11088;</span>
-        </div>"""
-
-    panel_html = f"""
-    <div style="background:#161b22;border:2px solid #8957e5;border-radius:8px;padding:1rem;box-shadow:0 0 10px rgba(137,87,229,0.12);">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0.5rem;">
-            <h3 style="font-size:1rem;font-weight:700;color:#e6edf3;margin:0;">AI Insights</h3>
-            <span style="display:inline-flex;align-items:center;gap:6px;font-size:0.7rem;font-weight:600;font-family:monospace;background:rgba(137,87,229,0.15);color:#8957e5;padding:2px 10px;border-radius:20px;border:1px solid rgba(137,87,229,0.3);">BATCH + ML</span>
+    st.html(f"""
+    <div class="panel panel-batch">
+        <div class="panel-hd">
+            <h3 class="panel-title">AI Insights</h3>
+            <span class="badge-ml">BATCH · ML</span>
         </div>
-        <div style="max-height:280px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#30363d #161b22;display:flex;flex-direction:column;gap:6px;">
-            {rows_html}
-        </div>
-    </div>"""
-    st.html(panel_html)
+        <div class="panel-desc">TRENDING PROBABILITY · ML CLUSTER · PREDICTED GROWTH</div>
+        {body}
+    </div>""")
 
 
 def main():
@@ -838,41 +1310,33 @@ def main():
     )
 
     with st.sidebar:
-        st.caption(f"Connected to: {HBASE_HOST}:{HBASE_PORT}")
-        st.caption("Tables: live_events, live_metrics, repos, weekly_metrics, ml_predictions")
-        st.caption("Batch orchestration: Airflow DAG (HDFS source)")
+        st.caption(f"Host: {HBASE_HOST}:{HBASE_PORT}")
+        st.caption("Tables: live_events · live_metrics · repos · weekly_metrics · ml_predictions")
+        st.caption("Orchestration: Airflow DAG (HDFS source)")
 
     render_header()
 
     col1, col2 = st.columns(2)
-
     with col1:
-        trending = trending_repos_df(limit=8)
-        render_trending_now(trending)
-
+        render_trending_now(trending_repos_df(limit=8))
     with col2:
-        lang_stats = language_stats_df()
-        render_rising_languages(lang_stats)
+        render_rising_languages(language_stats_df())
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
     col3, col4 = st.columns(2)
-
     with col3:
-        feed = activity_feed_df(limit=20)
-        render_activity_feed(feed)
-
+        render_activity_feed(activity_feed_df(limit=20))
     with col4:
-        hist = historical_df()
-        render_historical_trends(hist)
+        render_historical_trends(historical_df())
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
     col5, col6 = st.columns(2)
-
     with col5:
-        daily = trending_daily_df(limit=10)
-        render_trending_daily(daily)
-
+        render_trending_daily(trending_daily_df(limit=10))
     with col6:
-        insights = ai_insights_df(limit=5)
-        render_ai_insights(insights)
+        render_ai_insights(ai_insights_df(limit=5))
 
     time.sleep(refresh)
     st.rerun()

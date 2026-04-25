@@ -257,8 +257,6 @@ It:
 - triggers `spark-submit` in `opentrend-spark` (which processes previous day files only)
 - runs daily at 02:00
 
-Use Airflow as the single scheduler and remove duplicate schedulers.
-
 The DAG is configured for previous-day processing by default.
 
 Optional override: set `BATCH_DAY=YYYY-MM-DD` in the Spark environment to backfill a specific day.
@@ -272,7 +270,7 @@ Optional override: set `BATCH_DAY=YYYY-MM-DD` in the Spark environment to backfi
  
 | Panel | Source | Updates |
 |---|---|---|
-| Trending now | `live_metrics` | every 10 min via stream |
+| Trending now | `live_metrics` | every few seconds |
 | Rising languages | `weekly_metrics` | daily via batch |
 | Live activity feed | `events_stream` | every few seconds |
 | Historical trends | `weekly_metrics` | daily via batch |

@@ -107,15 +107,15 @@ with DAG(
 
     def build_cleanup_command(hdfs_path: str, retention_days: int) -> str:
         return (
-            "docker exec hadoop-master bash -lc '\n"
+            "docker exec hadoop-master bash -s <<'EOF'\n"
             "set -euo pipefail\n"
             f"hdfs_path={hdfs_path}\n"
             f"retention_days={retention_days}\n"
             "cutoff_date=$(date -u -d \"-$retention_days days\" +%Y-%m-%d)\n"
             "echo \"Cleaning up files older than $cutoff_date\"\n"
             "deleted=0\n"
-            "hdfs dfs -ls \"$hdfs_path\" | grep -E '\\.json\\.gz$' | while read -r perms repl owner group size date time path; do\n"
-            "  file_date=$(echo \"$path\" | sed -n 's|.*/\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\).*|\\1|p')\n"
+            "while read -r perms repl owner group size date time path; do\n"
+            "  file_date=$(printf '%s\n' \"$path\" | sed -n 's|.*/\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\).*|\\1|p')\n"
             "  if [[ -z \"$file_date\" ]]; then\n"
             "    echo \"Skipping $path - could not extract date from filename\"\n"
             "    continue\n"
@@ -125,9 +125,9 @@ with DAG(
             "    deleted=$((deleted + 1))\n"
             "    echo \"Deleted $path (dated $file_date)\"\n"
             "  fi\n"
-            "done\n"
+            "done < <(hdfs dfs -ls \"$hdfs_path\" | grep -E '\\.json\\.gz$')\n"
             "echo \"Deleted $deleted old files\"\n"
-            "'\n"
+            "EOF\n"
         )
 
     check_runtime_dependencies = BashOperator(
