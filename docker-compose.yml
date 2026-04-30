@@ -29,7 +29,8 @@ services:
     environment:
       - KAFKA_HOST=hadoop-master:9092
       - KAFKA_TOPIC=github-events
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN_STREAMING=${GITHUB_TOKEN_STREAMING}
+      - GITHUB_TOKEN=${GITHUB_TOKEN_STREAMING}
       - POLL_INTERVAL=60          # seconds between API polls
     volumes:
       - ./producer:/app           # live reload during development
@@ -54,7 +55,8 @@ services:
       - STREAM_CHECKPOINT=hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v3
       - HBASE_HOST=hadoop-master
       - HDFS_HOST=hadoop-master:9000
-      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_TOKEN_BATCH=${GITHUB_TOKEN_BATCH}
+      - GITHUB_TOKEN=${GITHUB_TOKEN_STREAMING}
     volumes:
       - ./spark:/app              # your .py job files
     command: >
@@ -102,6 +104,7 @@ services:
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - _AIRFLOW_WWW_USER_USERNAME=admin
       - _AIRFLOW_WWW_USER_PASSWORD=admin
+      - AIRFLOW__WEBSERVER__RATELIMIT_ENABLED=False
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/logs:/opt/airflow/logs
