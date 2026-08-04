@@ -142,13 +142,6 @@ def get_batch_day_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
-def get_ml_predictions(limit: int = 20) -> pd.DataFrame:
-    try:
-        rows = scan_rows("ml_predictions", limit=limit, latest_first=False)
-    except Exception:
-        return pd.DataFrame()
-    return rows_to_dataframe(rows)
-
 
 def trending_repos_df(limit: int = 8) -> pd.DataFrame:
     df = get_live_metrics(limit=limit)
@@ -353,23 +346,6 @@ def trending_daily_df(limit: int = 10) -> pd.DataFrame:
         })
     return pd.DataFrame(records)
 
-
-def ai_insights_df(limit: int = 10) -> pd.DataFrame:
-    df = get_ml_predictions(limit=limit)
-    if df.empty:
-        return pd.DataFrame(columns=["repo", "probability", "cluster", "predictedStars"])
-
-    records = []
-    for _, row in df.iterrows():
-        prob = float(row.get("ml:probability", 0))
-        records.append({
-            "repo": row.get("repo:name", row.get("row_key", "")),
-            "probability": prob,
-            "cluster": row.get("ml:cluster", "Unknown"),
-            "predictedStars": int(float(row.get("ml:predicted_growth", 0))),
-        })
-
-    return pd.DataFrame(records)
 
 
 # ─── Design system ────────────────────────────────────────────────────────────
@@ -638,23 +614,6 @@ CSS = """
     white-space: nowrap;
     flex-shrink: 0;
 }
-.badge-ml {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-family: 'Geist Mono', monospace;
-    font-size: 0.6rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    color: #c084fc;
-    background: rgba(192,132,252,0.08);
-    border: 1px solid rgba(192,132,252,0.2);
-    padding: 3px 9px;
-    border-radius: 99px;
-    white-space: nowrap;
-    flex-shrink: 0;
-}
-
 /* ── Scroll containers ── */
 .scroll-box {
     max-height: 340px;
@@ -899,69 +858,6 @@ CSS = """
     transition: width 0.5s ease;
 }
 
-/* ── AI insights ── */
-.insight-row {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 10px 10px;
-    border-radius: 8px;
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.03);
-    transition: border-color 0.15s, background 0.15s;
-    margin-bottom: 6px;
-}
-.insight-row:hover {
-    background: rgba(255,255,255,0.035);
-    border-color: rgba(192,132,252,0.12);
-}
-.insight-name {
-    flex: 1;
-    font-weight: 600;
-    font-size: 0.78rem;
-    color: #e2e8f0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-family: 'Geist', sans-serif;
-}
-.insight-cluster {
-    font-family: 'Geist Mono', monospace;
-    font-size: 0.6rem;
-    color: #475569;
-    width: 110px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.insight-prob-bar {
-    width: 60px;
-    height: 4px;
-    background: rgba(255,255,255,0.06);
-    border-radius: 2px;
-    overflow: hidden;
-}
-.insight-prob-fill {
-    height: 100%;
-    border-radius: 2px;
-    background: linear-gradient(90deg, #10b981, #34d399);
-}
-.insight-prob-label {
-    font-family: 'Geist Mono', monospace;
-    font-size: 0.72rem;
-    font-weight: 700;
-    color: #10b981;
-    width: 36px;
-    text-align: right;
-}
-.insight-stars {
-    font-family: 'Geist Mono', monospace;
-    font-size: 0.62rem;
-    color: #334155;
-    width: 58px;
-    text-align: right;
-}
-
 /* ── Divider ── */
 .section-gap { height: 1rem; }
 
@@ -1169,9 +1065,13 @@ def render_historical_trends(df: pd.DataFrame):
         render_header(FULL_HIST)
 
         chart_df = df.copy()
-        # String dates → category axis → exactly one tick per day, no duplicates
-        chart_df["day"] = pd.to_datetime(chart_df["day"], errors="coerce").dt.strftime("%d %b")
+        # Sort by the real date first — "%d %b" strings like "31 Jul" vs
+        # "01 Aug" sort wrong alphabetically ('3' > '0'), so the date order
+        # must be locked in before reformatting for display.
+        chart_df["day"] = pd.to_datetime(chart_df["day"], errors="coerce")
         chart_df = chart_df.dropna(subset=["day"]).sort_values("day")
+        # String dates → category axis → exactly one tick per day, no duplicates
+        chart_df["day"] = chart_df["day"].dt.strftime("%d %b")
         languages = [c for c in chart_df.columns if c != "day"]
 
         palette = ["#10b981", "#818cf8", "#fbbf24", "#f43f5e", "#22d3ee", "#c084fc", "#34d399"]
@@ -1263,42 +1163,6 @@ def render_trending_daily(df: pd.DataFrame):
     </div>""")
 
 
-def render_ai_insights(df: pd.DataFrame):
-    if df.empty:
-        body = '<div class="empty-state"><div class="empty-state-icon">🤖</div>No ML predictions yet — run the batch job first.</div>'
-    else:
-        rows = ""
-        for _, row in df.iterrows():
-            repo = escape(row.get("repo", ""))
-            prob = row.get("probability", 0)
-            prob_pct = int(prob * 100)
-            cluster = escape(str(row.get("cluster", "")))
-            stars = int(row.get("predictedStars", 0))
-            rows += f"""
-            <div class="insight-row">
-                <span class="insight-name">{repo}</span>
-                <span class="insight-cluster">{cluster}</span>
-                <div style="display:flex;flex-direction:column;align-items:flex-end;gap:3px;">
-                    <div class="insight-prob-bar">
-                        <div class="insight-prob-fill" style="width:{prob_pct}%;"></div>
-                    </div>
-                    <span class="insight-prob-label">{prob_pct}%</span>
-                </div>
-                <span class="insight-stars">+{stars:,} ★</span>
-            </div>"""
-        body = rows
-
-    st.html(f"""
-    <div class="panel panel-batch">
-        <div class="panel-hd">
-            <h3 class="panel-title">AI Insights</h3>
-            <span class="badge-ml">BATCH · ML</span>
-        </div>
-        <div class="panel-desc">TRENDING PROBABILITY · ML CLUSTER · PREDICTED GROWTH</div>
-        {body}
-    </div>""")
-
-
 def main():
     st.title("")
 
@@ -1311,32 +1175,32 @@ def main():
 
     with st.sidebar:
         st.caption(f"Host: {HBASE_HOST}:{HBASE_PORT}")
-        st.caption("Tables: live_events · live_metrics · repos · weekly_metrics · ml_predictions")
+        st.caption("Tables: live_events · live_metrics · repos · weekly_metrics")
         st.caption("Orchestration: Airflow DAG (HDFS source)")
 
     render_header()
 
+    # Live panels together up top
     col1, col2 = st.columns(2)
     with col1:
         render_trending_now(trending_repos_df(limit=8))
     with col2:
-        render_rising_languages(language_stats_df())
+        render_activity_feed(activity_feed_df(limit=20))
 
     st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
 
+    # Historical Trends gets the full row — a multi-day line chart reads
+    # better wide than squeezed into half a column.
+    render_historical_trends(historical_df())
+
+    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
+
+    # Batch ranking panels together at the bottom
     col3, col4 = st.columns(2)
     with col3:
-        render_activity_feed(activity_feed_df(limit=20))
+        render_rising_languages(language_stats_df())
     with col4:
-        render_historical_trends(historical_df())
-
-    st.markdown('<div class="section-gap"></div>', unsafe_allow_html=True)
-
-    col5, col6 = st.columns(2)
-    with col5:
         render_trending_daily(trending_daily_df(limit=10))
-    with col6:
-        render_ai_insights(ai_insights_df(limit=5))
 
     time.sleep(refresh)
     st.rerun()

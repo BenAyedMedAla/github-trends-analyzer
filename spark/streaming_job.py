@@ -1,14 +1,20 @@
 """
 opentrend — streaming_job.py
 ------------------------------
-Consumes GitHub events from Kafka using Spark Structured Streaming,
-aggregates them in 10-minute tumbling windows, and writes results
-to HBase.
+Consumes GitHub events from Kafka using Spark Structured Streaming
+and writes them to HBase, bucketed into 10-minute windows.
+
+The window write is stateless on the Spark side: each event is tagged
+with its 10-minute bucket as a plain column (not Spark's window()
+operator), and per-window/per-repo counts are accumulated via HBase's
+own atomic increment. This avoids Spark's streaming state store
+(HDFS-backed) entirely, which otherwise adds per-batch I/O overhead
+disproportionate to this pipeline's small event volume.
 
 Pipeline:
   Kafka (github-events)
     → Spark Structured Streaming
-      → 10-min window aggregation
+      → 10-min window bucket (per-event, stateless)
         → HBase: live_metrics  (top repos by event count)
         → HBase: repos         (enrichment — repo details)
 """
@@ -21,7 +27,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, from_json, window, count, to_timestamp, max as spark_max, unix_timestamp, lit
+from pyspark.sql.functions import col, from_json, to_timestamp, unix_timestamp, floor
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
 load_dotenv()
@@ -33,8 +39,9 @@ HBASE_HOST  = os.getenv("HBASE_HOST",  "hadoop-master")
 HBASE_PORT  = int(os.getenv("HBASE_PORT", "9090"))
 CHECKPOINT  = os.getenv(
     "STREAM_CHECKPOINT",
-    "hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v3"
+    "hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v5"
 )
+WINDOW_SECONDS = 600  # 10-minute bucket
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -137,7 +144,10 @@ def write_live_events(batch_df, batch_id):
 def write_to_hbase(batch_df, batch_id):
     """
     Called for every micro-batch by Spark Structured Streaming.
-    Writes aggregated window results to:
+    Each row is one raw event tagged with its 10-min window bucket;
+    per-window/per-repo event counts are accumulated via HBase's atomic
+    increment rather than a Spark streaming aggregation, so this query
+    needs no state store. Writes to:
       - live_metrics : top repos by event count per 10-min window
       - repos        : repo enrichment (language, name)
     """
@@ -158,7 +168,6 @@ def write_to_hbase(batch_df, batch_id):
         for row in rows:
             repo_name = row["repo_name"] or "unknown"
             event_type = row["event_type"] or "unknown"
-            event_count = str(row["event_count"])
             window_start = str(row["window_start"])
             language = row["language"] or "Unknown"
             stars_count = str(row["stars_count"] or 0)
@@ -172,6 +181,10 @@ def write_to_hbase(batch_df, batch_id):
             # same repo/window when multiple event types exist.
             row_key = f"{window_start}#{repo_name}#{event_type}".encode("utf-8")
 
+            # Accumulate the event count across batches via HBase's own
+            # atomic increment instead of a Spark streaming state store.
+            live_table.counter_inc(row_key, b"metrics:count")
+
             live_table.put(row_key, {
                 b"repo:name":       repo_name.encode("utf-8"),
                 b"repo:event_type": event_type.encode("utf-8"),
@@ -181,7 +194,6 @@ def write_to_hbase(batch_df, batch_id):
                 b"repo:watchers":   watchers_count.encode("utf-8"),
                 b"repo:key":        repo_key,
                 b"metrics:week":    weekly_week.encode("utf-8"),
-                b"metrics:count":   event_count.encode("utf-8"),
                 b"metrics:window":  window_start.encode("utf-8"),
             })
 
@@ -216,6 +228,7 @@ def main():
         SparkSession.builder
         .appName("opentrend-streaming")
         .config("spark.sql.streaming.checkpointLocation", CHECKPOINT)
+        .config("spark.sql.shuffle.partitions", "2")
         .getOrCreate()
     )
 
@@ -254,41 +267,33 @@ def main():
         )
     )
 
-    # ── 10-minute Tumbling Window Aggregation ─────────────────
-    # Groups by repo + event_type + language per 10-min window
-    # event_count = number of events that repo received in that window
+    # ── 10-minute window bucket (per-event, stateless) ───────
+    # window_start is a plain column computed per event, not Spark's
+    # window() operator — so this query needs no state store. Counts
+    # per repo/window are accumulated in HBase itself (see write_to_hbase).
     windowed = (
         parsed
-        .withWatermark("event_timestamp", "5 minutes")
-        .groupBy(
-            window(col("event_timestamp"), "10 minutes"),
-            col("repo_name"),
-            col("event_type"),
-            col("language"),
-        )
-        .agg(
-            count("*").alias("event_count"),
-            spark_max("stars_count").alias("stars_count"),
-            spark_max("forks_count").alias("forks_count"),
-            spark_max("watchers_count").alias("watchers_count"),
+        .withColumn(
+            "window_start",
+            (floor(unix_timestamp(col("event_timestamp")) / WINDOW_SECONDS) * WINDOW_SECONDS)
+            .cast("timestamp")
+            .cast("string"),
         )
         .select(
-            col("window.start").cast("string").alias("window_start"),
-            col("window.end").cast("string").alias("window_end"),
-            col("repo_name"),
-            col("event_type"),
-            col("language"),
-            col("stars_count"),
-            col("forks_count"),
-            col("watchers_count"),
-            col("event_count"),
+            "window_start",
+            "repo_name",
+            "event_type",
+            "language",
+            "stars_count",
+            "forks_count",
+            "watchers_count",
         )
     )
 
     # ── Write to HBase via foreachBatch ───────────────────────
     query = (
         windowed.writeStream
-        .outputMode("update")
+        .outputMode("append")
         .foreachBatch(write_to_hbase)
         .option("checkpointLocation", CHECKPOINT)
         .trigger(processingTime="30 seconds")

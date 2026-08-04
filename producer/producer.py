@@ -28,7 +28,9 @@ KAFKA_HOST  = os.getenv("KAFKA_HOST", "hadoop-master:9092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "github-events")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 POLL_INTERVAL = 5
-GITHUB_API_URL = "https://api.github.com/events?per_page=100"
+GITHUB_API_URL = "https://api.github.com/events"
+EVENTS_PER_PAGE = 100          # GitHub's hard cap for this endpoint
+EVENTS_PAGES = int(os.getenv("EVENTS_PAGES", "3"))  # 3 pages ≈ 300 events/poll
 
 # ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -122,29 +124,42 @@ def resolve_fork(event: dict) -> str:
 
 
 def fetch_events() -> list:
-    """Fetch the latest public GitHub events."""
-    try:
-        response = requests.get(
-            GITHUB_API_URL,
-            headers=build_headers(),
-            timeout=10
-        )
+    """
+    Fetch the latest public GitHub events, paging through up to
+    EVENTS_PAGES pages (100 events each — GitHub's per-page cap) to
+    widen each poll's slice of the timeline. Stops early on a short
+    page, since that means there's nothing further back to fetch.
+    """
+    events = []
+    for page in range(1, EVENTS_PAGES + 1):
+        try:
+            response = requests.get(
+                GITHUB_API_URL,
+                params={"per_page": EVENTS_PER_PAGE, "page": page},
+                headers=build_headers(),
+                timeout=10
+            )
 
-        if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 403:
-            log.warning("GitHub API rate limit reached. Add a token to increase limit.")
-            return []
-        elif response.status_code == 304:
-            log.info("No new events since last poll.")
-            return []
-        else:
-            log.error(f"GitHub API error: {response.status_code}")
-            return []
+            if response.status_code == 200:
+                page_events = response.json()
+                events.extend(page_events)
+                if len(page_events) < EVENTS_PER_PAGE:
+                    break
+            elif response.status_code == 403:
+                log.warning("GitHub API rate limit reached. Add a token to increase limit.")
+                break
+            elif response.status_code == 304:
+                log.info("No new events since last poll.")
+                break
+            else:
+                log.error(f"GitHub API error: {response.status_code}")
+                break
 
-    except requests.exceptions.RequestException as e:
-        log.error(f"Network error fetching events: {e}")
-        return []
+        except requests.exceptions.RequestException as e:
+            log.error(f"Network error fetching events: {e}")
+            break
+
+    return events
 
 
 def process_and_publish(producer: KafkaProducer):
@@ -223,6 +238,7 @@ def main():
     log.info(f"  Kafka broker : {KAFKA_HOST}")
     log.info(f"  Kafka topic  : {KAFKA_TOPIC}")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
+    log.info(f"  Events pages : {EVENTS_PAGES} ({EVENTS_PAGES * EVENTS_PER_PAGE} events/poll max)")
     log.info(f"  GitHub token : {'set' if GITHUB_TOKEN else 'NOT SET (60 req/hr limit)'}")
 
     producer = create_producer()

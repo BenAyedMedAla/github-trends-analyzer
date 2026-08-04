@@ -320,7 +320,7 @@ def batch_enrich_repos(repo_names: list) -> dict:
             alias_to_repo[alias] = repo
             queries.append(
                 f'{alias}: repository(owner: "{owner}", name: "{name}") '
-                f'{{ language {{ name }} stargazersCount forkCount }}'
+                f'{{ primaryLanguage {{ name }} stargazerCount forkCount }}'
             )
 
         if not queries:
@@ -352,16 +352,6 @@ def batch_enrich_repos(repo_names: list) -> dict:
             payload = resp.json()
             data    = payload.get("data") or {}
             errors  = payload.get("errors") or []
-            if errors:
-                log.warning("GraphQL returned %d errors in batch", len(errors))
-                unresolved_after_graphql.extend(batch)
-                remaining = repos_needing_api[i + batch_size :]
-                unresolved_after_graphql.extend(remaining)
-                log.warning(
-                    "GraphQL error detected. Switching remaining %d repos to REST fallback.",
-                    len(remaining),
-                )
-                break
 
             if _has_graphql_rate_limit_or_auth_error(payload):
                 unresolved_after_graphql.extend(batch)
@@ -373,15 +363,23 @@ def batch_enrich_repos(repo_names: list) -> dict:
                 )
                 break
 
+            if errors:
+                log.info(
+                    "GraphQL batch had %d partial error(s) (likely renamed/deleted "
+                    "repos) — resolving unaffected repos from this batch, REST "
+                    "fallback for the rest",
+                    len(errors),
+                )
+
             resolved_in_batch: set = set()
             for alias, repo in alias_to_repo.items():
                 repo_data = data.get(alias)
                 if not repo_data:
                     continue
-                lang_obj = repo_data.get("language") or {}
+                lang_obj = repo_data.get("primaryLanguage") or {}
                 enrichment_map[repo] = {
                     "language":         lang_obj.get("name") or "Unknown",
-                    "stargazers_count": repo_data.get("stargazersCount") or 0,
+                    "stargazers_count": repo_data.get("stargazerCount") or 0,
                     "forks_count":      repo_data.get("forkCount") or 0,
                 }
                 resolved_in_batch.add(repo)

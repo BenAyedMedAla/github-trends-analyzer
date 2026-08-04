@@ -52,7 +52,7 @@ services:
       - YARN_CONF_DIR=/etc/hadoop
       - KAFKA_HOST=hadoop-master:9092
       - KAFKA_TOPIC=github-events
-      - STREAM_CHECKPOINT=hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v3
+      - STREAM_CHECKPOINT=hdfs://hadoop-master:9000/user/root/opentrend/checkpoints/streaming-v5
       - HBASE_HOST=hadoop-master
       - HDFS_HOST=hadoop-master:9000
       - GITHUB_TOKEN_BATCH=${GITHUB_TOKEN_BATCH}
